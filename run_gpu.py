@@ -17,7 +17,7 @@ import yaml
 
 from core import (TriangleGraphGPU, build_from_vtp, build_adjacency,
                   compute_edge_distances, clean_mesh, find_border_triangles,
-                  run_voting)
+                  run_voting, save_vtp)
 
 
 def shape_index_classify(si):
@@ -140,6 +140,7 @@ def main():
     parser.add_argument('--exclude-borders', type=int, default=0)
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--no-clean', action='store_true')
+    parser.add_argument('--no-vtp', action='store_true', help='Skip VTP output')
     parser.add_argument('--config', type=str, default=None)
     parser.add_argument('--device', type=str, default=None)
     args = parser.parse_args()
@@ -184,7 +185,12 @@ def main():
     # 3. Run voting (per-triangle on triangle adjacency graph)
     run_voting(tg, args.radius_hit, args.batch_size)
 
-    # 4. Extract curvatures
+    # 4. Write VTP output
+    if not args.no_vtp:
+        vtp_out = output_dir / f"{basename}.AVV_rh{rh_str}.vtp"
+        save_vtp(tg, str(vtp_out))
+
+    # 5. Extract curvatures (CSV)
     csv_path = output_dir / f"{basename}.AVV_rh{rh_str}.csv"
     extract_curvatures(tg, str(csv_path))
 

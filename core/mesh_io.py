@@ -131,6 +131,72 @@ def compute_edge_distances(tg):
     return tg
 
 
+def save_vtp(tg, filepath):
+    """Write triangle mesh with curvature cell arrays to a VTP file."""
+    points_np = tg.points.cpu().numpy()  # [T, 3, 3]
+    T = points_np.shape[0]
+
+    # Deduplicate vertices (shared points across triangles)
+    flat_pts = points_np.reshape(-1, 3)  # [3T, 3]
+    unique_pts, inverse = np.unique(flat_pts, axis=0, return_inverse=True)
+    face_ids = inverse.reshape(T, 3)  # [T, 3] -> index into unique_pts
+
+    # Build VTK points
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_support.numpy_to_vtk(unique_pts, deep=True))
+
+    # Build VTK triangles
+    cells = vtk.vtkCellArray()
+    connectivity = np.column_stack([
+        np.full(T, 3, dtype=np.int64), face_ids
+    ]).ravel()
+    cells.SetCells(T, numpy_support.numpy_to_vtkIdTypeArray(connectivity, deep=True))
+
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(vtk_points)
+    poly.SetPolys(cells)
+
+    # Cell data arrays: (name, tensor, num_components)
+    cell_arrays = [
+        ('xyz', tg.centers, 3),
+        ('area', tg.areas, 1),
+        ('normal', tg.normals, 3),
+    ]
+    if tg.n_v is not None:
+        cell_arrays.append(('n_v', tg.n_v, 3))
+    if tg.orientation_class is not None:
+        cell_arrays.append(('orientation_class', tg.orientation_class, 1))
+    if tg.t_1 is not None:
+        cell_arrays.append(('t_1', tg.t_1, 3))
+    if tg.t_2 is not None:
+        cell_arrays.append(('t_2', tg.t_2, 3))
+    if tg.kappa_1 is not None:
+        cell_arrays += [
+            ('kappa_1', tg.kappa_1, 1),
+            ('kappa_2', tg.kappa_2, 1),
+            ('gauss_curvature_VV', tg.gauss_curvature, 1),
+            ('mean_curvature_VV', tg.mean_curvature, 1),
+            ('shape_index_VV', tg.shape_index, 1),
+            ('curvedness_VV', tg.curvedness, 1),
+        ]
+
+    for name, tensor, ncomp in cell_arrays:
+        arr = tensor.cpu().numpy().astype(np.float64)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        vtk_arr = numpy_support.numpy_to_vtk(arr, deep=True)
+        vtk_arr.SetName(name)
+        vtk_arr.SetNumberOfComponents(ncomp)
+        poly.GetCellData().AddArray(vtk_arr)
+
+    writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetFileName(str(filepath))
+    writer.SetInputData(poly)
+    if writer.Write() != 1:
+        raise RuntimeError(f"Failed to write VTP file: {filepath}")
+    print(f"Wrote VTP with {T} triangles, {poly.GetCellData().GetNumberOfArrays()} arrays to {filepath}")
+
+
 def build_vertex_graph(tg):
     """
     Build vertex-level graph from triangle data. Must run AFTER preprocessing
