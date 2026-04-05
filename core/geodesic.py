@@ -105,9 +105,6 @@ def _extract_subgraph(tg, sources, g_max, max_iters):
     local_nodes = reached.nonzero(as_tuple=False).squeeze(1)  # [L] global IDs
     L = local_nodes.shape[0]
 
-    if L > 0 and T > 10000:
-        pct = L / T * 100
-        print(f"    subgraph: {L}/{T} nodes ({pct:.1f}%), {sources.shape[0]} sources")
 
     global_to_local = torch.full((T,), -1, dtype=torch.long, device=device)
     global_to_local[local_nodes] = torch.arange(L, device=device)
