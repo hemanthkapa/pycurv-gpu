@@ -17,7 +17,7 @@ import yaml
 
 from core import (TriangleGraphGPU, build_from_vtp, build_adjacency,
                   compute_edge_distances, clean_mesh, find_border_triangles,
-                  run_voting, save_vtp)
+                  run_voting, save_vtp, build_csr)
 
 
 def shape_index_classify(si):
@@ -176,7 +176,7 @@ def main():
     build_from_vtp(str(vtp_path), tg)
     build_adjacency(tg)
     compute_edge_distances(tg)
-
+    build_csr(tg)
 
     # 2. Preprocess
     if not args.no_clean:
