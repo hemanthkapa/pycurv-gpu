@@ -46,18 +46,12 @@ def normal_vector_voting(tg, g_max, batch_size=256):
         end = min(start + batch_size, T)
         sources = torch.arange(start, end, device=device)
 
-        # SSSP on triangle adjacency graph
-        dist = sssp_triangle_batch(tg, sources, g_max)  # [B, T]
-
-        # Neighbors: distance > 0 and <= g_max
-        is_nbr = (dist > 0) & (dist <= g_max)  # [B, T]
-        src_local, nbr_idx = is_nbr.nonzero(as_tuple=True)
+        # SSSP on triangle adjacency graph — returns sparse neighbors
+        src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
 
         if src_local.numel() == 0:
-            del dist, is_nbr
             continue
 
-        g_i = dist[src_local, nbr_idx]
         src_global = sources[src_local]
 
         # Normal vote: n_i = n_c + 2*cos(theta)*vc_hat  (Page et al. Eq. 6)
@@ -82,7 +76,7 @@ def normal_vector_voting(tg, g_max, batch_size=256):
         idx = src_global.view(-1, 1, 1).expand_as(V_i)
         V_matrices.scatter_add_(0, idx, V_i)
 
-        del dist, is_nbr, V_i, wn
+        del V_i, wn
 
         if (b_idx + 1) % max(1, num_batches // 5) == 0 or (b_idx + 1) == num_batches:
             elapsed = time.time() - t0
@@ -148,17 +142,19 @@ def curvature_voting(tg, g_max, batch_size=256):
         end = min(start + batch_size, num_surface)
         sources = surface_ids[start:end]
 
-        dist = sssp_triangle_batch(tg, sources, g_max)  # [B, T]
+        # SSSP on triangle adjacency graph — returns sparse neighbors
+        src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
 
-        # Neighbors: distance > 0, <= g_max, surface only
-        is_nbr = (dist > 0) & (dist <= g_max) & is_surface.unsqueeze(0)
-        src_local, nbr_idx = is_nbr.nonzero(as_tuple=True)
+        # Filter to surface-only neighbors
+        if src_local.numel() > 0:
+            surface_mask = is_surface[nbr_idx]
+            src_local = src_local[surface_mask]
+            nbr_idx = nbr_idx[surface_mask]
+            g_i = g_i[surface_mask]
 
         if src_local.numel() == 0:
-            del dist, is_nbr
             continue
 
-        g_i = dist[src_local, nbr_idx]
         src_global = sources[src_local]
 
         # Weight: (area_i / max_area) * exp(-g_i / sigma)  [AVV]
@@ -199,7 +195,7 @@ def curvature_voting(tg, g_max, batch_size=256):
         B_matrices.scatter_add_(0, idx, B_i.to(torch.float64))
         weight_sums.scatter_add_(0, src_global, w_i.to(torch.float64))
 
-        del dist, is_nbr, B_i
+        del B_i
 
         if (b_idx + 1) % max(1, num_batches // 5) == 0 or (b_idx + 1) == num_batches:
             elapsed = time.time() - t0
