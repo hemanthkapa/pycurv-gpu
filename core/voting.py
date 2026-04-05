@@ -303,17 +303,19 @@ def _fix_normal_orientation(tg, n_v):
 
 
 def _auto_voting_batch(num_triangles, requested, device):
-    # With sparse SSSP, dense matrix is [B, L] where L ~ 2-5% of T.
-    # Estimate conservatively at 5% for memory sizing.
-    estimated_subgraph = max(int(num_triangles * 0.05), 1000)
-    bytes_per_source = estimated_subgraph * 9 + 4000
+    # With sparse SSSP, the subgraph is the UNION of reachable nodes from
+    # all B sources. More sources = larger union. At B=256, subgraph ~2% of T.
+    # Union grows sublinearly with B (sources overlap). Estimate:
+    #   L ~ min(T, per_source_reach * B^0.6)
+    # Conservative: use full T for memory estimate (safe upper bound).
+    # The real gain from sparse SSSP is avoiding the clone, not the allocation.
+    bytes_per_source = num_triangles * 9 + 4000
     free_mem = get_free_memory(device)
     max_bytes = free_mem * 0.40
     safe = max(1, int(max_bytes / bytes_per_source))
     chosen = min(requested, safe)
     if chosen < requested:
-        print(f"Auto-reduced voting batch {requested} -> {chosen} "
-              f"(est subgraph {estimated_subgraph})")
+        print(f"Auto-reduced voting batch {requested} -> {chosen}")
     return chosen
 
 
