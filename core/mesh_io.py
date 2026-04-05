@@ -72,7 +72,6 @@ def build_adjacency(tg):
     T = faces.shape[0]
 
     # Build point -> triangle mapping
-    # For each vertex, find all triangles that use it
     flat_pts = faces.ravel()       # [3T]
     flat_tris = np.repeat(np.arange(T), 3)  # [3T]
 
@@ -81,44 +80,61 @@ def build_adjacency(tg):
     sorted_pts = flat_pts[sort_idx]
     sorted_tris = flat_tris[sort_idx]
 
-    # Find boundaries between different point IDs
+    # Find group boundaries for each point
     change = np.concatenate([[0], np.where(np.diff(sorted_pts) != 0)[0] + 1,
                              [len(sorted_pts)]])
+    group_sizes = np.diff(change)
 
-    # For each point, all triangles sharing it are neighbors of each other
-    src_list = []
-    dst_list = []
-    shared_count = {}  # (min_tri, max_tri) -> count of shared vertices
+    # Generate all triangle pairs sharing a vertex (fully vectorized)
+    # For each entry in a group, pair it with every later entry in that group.
+    # group_id[j] = which group sorted_tris[j] belongs to
+    group_id = np.repeat(np.arange(len(group_sizes)), group_sizes)
+    # local position within group
+    local_pos = np.arange(len(sorted_tris)) - change[group_id]
 
-    for i in range(len(change) - 1):
-        tris_at_point = sorted_tris[change[i]:change[i+1]]
-        n = len(tris_at_point)
-        if n < 2:
-            continue
-        # All pairs of triangles sharing this point
-        for a in range(n):
-            for b in range(a + 1, n):
-                ta, tb = int(tris_at_point[a]), int(tris_at_point[b])
-                key = (min(ta, tb), max(ta, tb))
-                shared_count[key] = shared_count.get(key, 0) + 1
+    # For each element j, pair with elements j+1..end of group.
+    # Repeat each element (group_size - 1 - local_pos) times.
+    repeats = (group_sizes[group_id] - 1 - local_pos).astype(np.intp)
+    repeats = np.maximum(repeats, 0)
 
-    # Create bidirectional edges
-    edges_src = []
-    edges_dst = []
-    is_strong = []
+    pair_a = np.repeat(sorted_tris, repeats)
 
-    for (ta, tb), count in shared_count.items():
-        edges_src.extend([ta, tb])
-        edges_dst.extend([tb, ta])
-        strong = 1 if count >= 2 else 0
-        is_strong.extend([strong, strong])
+    # For pair_b: for element j in group of size k, partners are
+    # the elements at local positions (local_pos+1)..(k-1).
+    # Build partner indices using cumulative offsets.
+    total_pairs = repeats.sum()
+    # For each repeated element j, the partners are consecutive entries after j
+    partner_offsets = np.arange(len(sorted_tris)) + 1  # index of first partner
+    partner_starts = np.repeat(partner_offsets, repeats)
+    # Within each repeated block, add 0, 1, 2, ... to get successive partners
+    block_lengths = repeats[repeats > 0]
+    within_block = np.arange(total_pairs) - np.repeat(
+        np.concatenate([[0], np.cumsum(block_lengths[:-1])]), block_lengths)
+    pair_b = sorted_tris[partner_starts + within_block]
+
+    # Canonicalize: (min, max) and count shared vertices per pair
+    lo = np.minimum(pair_a, pair_b)
+    hi = np.maximum(pair_a, pair_b)
+
+    # Encode pairs as single int for fast grouping
+    edge_keys = lo.astype(np.int64) * T + hi.astype(np.int64)
+    unique_keys, inverse, counts = np.unique(edge_keys, return_inverse=True, return_counts=True)
+
+    ta = unique_keys // T
+    tb = unique_keys % T
+    strong = (counts >= 2).astype(np.int64)
+
+    # Bidirectional edges
+    edges_src = np.concatenate([ta, tb])
+    edges_dst = np.concatenate([tb, ta])
+    is_strong = np.concatenate([strong, strong])
 
     tg.edge_src = torch.tensor(edges_src, dtype=torch.long, device=tg.device)
     tg.edge_dst = torch.tensor(edges_dst, dtype=torch.long, device=tg.device)
     tg.is_strong = torch.tensor(is_strong, dtype=torch.long, device=tg.device)
 
-    num_strong = sum(1 for s in is_strong if s == 1) // 2
-    num_weak = sum(1 for s in is_strong if s == 0) // 2
+    num_strong = int(strong.sum())
+    num_weak = len(strong) - num_strong
     print(f"Built adjacency: {num_strong} strong + {num_weak} weak edges")
     return tg
 
