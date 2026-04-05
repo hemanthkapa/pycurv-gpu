@@ -60,16 +60,24 @@ def sssp_batch(edge_src, edge_dst, edge_dist, num_nodes,
         if g_max is not None:
             proposal = proposal.clamp(max=g_max + 1e-6)
 
-        updated = dist.clone()
-        dst_expanded = a_dst.unsqueeze(0).expand(B, A)
-        updated.scatter_reduce_(1, dst_expanded, proposal,
-                                reduce='amin', include_self=True)
+        # Scatter proposals into a small buffer for unique destinations only
+        unique_dst, inv = a_dst.unique(return_inverse=True)
+        D = unique_dst.shape[0]
 
-        improved = updated < dist - 1e-10
+        old_vals = dist[:, unique_dst].clone()  # [B, D]
+        buf = old_vals.clone()
+
+        inv_expanded = inv.unsqueeze(0).expand(B, A)
+        buf.scatter_reduce_(1, inv_expanded, proposal,
+                            reduce='amin', include_self=True)
+
+        improved_at_dst = buf < old_vals - 1e-10
         if g_max is not None:
-            improved &= (updated <= g_max)
-        is_active = improved
-        dist = updated
+            improved_at_dst &= (buf <= g_max)
+
+        dist[:, unique_dst] = buf
+        is_active.zero_()
+        is_active[:, unique_dst] = improved_at_dst
 
         if not is_active.any():
             break

@@ -141,8 +141,6 @@ def main():
     parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--no-clean', action='store_true')
     parser.add_argument('--no-vtp', action='store_true', help='Skip VTP output')
-    parser.add_argument('--strong-only', action='store_true',
-                        help='Use only strong edges (shared-edge adjacency)')
     parser.add_argument('--config', type=str, default=None)
     parser.add_argument('--device', type=str, default=None)
     args = parser.parse_args()
@@ -179,13 +177,6 @@ def main():
     build_adjacency(tg)
     compute_edge_distances(tg)
 
-    if args.strong_only:
-        mask = tg.is_strong == 1
-        tg.edge_src = tg.edge_src[mask]
-        tg.edge_dst = tg.edge_dst[mask]
-        tg.edge_dist = tg.edge_dist[mask]
-        tg.is_strong = tg.is_strong[mask]
-        print(f"Strong-only: {mask.sum().item() // 2} edges kept")
 
     # 2. Preprocess
     if not args.no_clean:
