@@ -162,6 +162,7 @@ def _sssp_dense(edge_src, edge_dst, edge_dist, num_nodes,
                 sources, g_max=None, max_iters=None):
     """
     Dense batched SSSP via frontier relaxation on a compact subgraph.
+    With subgraph extraction, V is small (~5K), so full clone is cheap.
     """
     device = edge_src.device
     B = sources.shape[0]
@@ -197,22 +198,16 @@ def _sssp_dense(edge_src, edge_dst, edge_dist, num_nodes,
         if g_max is not None:
             proposal = proposal.clamp(max=g_max + 1e-6)
 
-        unique_dst, inv = a_dst.unique(return_inverse=True)
+        updated = dist.clone()
+        dst_expanded = a_dst.unsqueeze(0).expand(B, A)
+        updated.scatter_reduce_(1, dst_expanded, proposal,
+                                reduce='amin', include_self=True)
 
-        old_vals = dist[:, unique_dst].clone()
-        buf = old_vals.clone()
-
-        inv_expanded = inv.unsqueeze(0).expand(B, A)
-        buf.scatter_reduce_(1, inv_expanded, proposal,
-                            reduce='amin', include_self=True)
-
-        improved_at_dst = buf < old_vals - 1e-10
+        improved = updated < dist - 1e-10
         if g_max is not None:
-            improved_at_dst &= (buf <= g_max)
-
-        dist[:, unique_dst] = buf
-        is_active.zero_()
-        is_active[:, unique_dst] = improved_at_dst
+            improved &= (updated <= g_max)
+        is_active = improved
+        dist = updated
 
         if not is_active.any():
             break
