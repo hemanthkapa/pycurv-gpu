@@ -21,6 +21,7 @@ Reference: Page et al. 2002, Tong & Tang 2005, CPU pycurv surface_graphs.py
 import torch
 import math
 import time
+import numpy as np
 
 from .geodesic import sssp_triangle_batch, get_free_memory
 
@@ -29,7 +30,7 @@ from .geodesic import sssp_triangle_batch, get_free_memory
 # Pass 1: Normal Vector Voting (per-triangle)
 # ---------------------------------------------------------------------------
 
-def normal_vector_voting(tg, g_max, batch_size=256):
+def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
@@ -39,12 +40,15 @@ def normal_vector_voting(tg, g_max, batch_size=256):
 
     batch_size = _auto_voting_batch(T, batch_size, device)
 
+    # Use spatial ordering for better subgraph locality
+    all_sources = spatial_order if spatial_order is not None else torch.arange(T, device=device)
+
     t0 = time.time()
     num_batches = (T + batch_size - 1) // batch_size
 
     for b_idx, start in enumerate(range(0, T, batch_size)):
         end = min(start + batch_size, T)
-        sources = torch.arange(start, end, device=device)
+        sources = all_sources[start:end]
 
         # SSSP on triangle adjacency graph — returns sparse neighbors
         src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
@@ -119,7 +123,7 @@ def normal_vector_voting(tg, g_max, batch_size=256):
 # Pass 2: Curvature Voting (AVV — area-weighted, per-triangle)
 # ---------------------------------------------------------------------------
 
-def curvature_voting(tg, g_max, batch_size=256):
+def curvature_voting(tg, g_max, batch_size=256, spatial_order=None):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
@@ -130,7 +134,12 @@ def curvature_voting(tg, g_max, batch_size=256):
     weight_sums = torch.zeros(T, dtype=torch.float64, device=device)
 
     is_surface = tg.orientation_class == 1
-    surface_ids = is_surface.nonzero(as_tuple=False).squeeze(1)
+
+    # Use spatial ordering, filtered to surface-only triangles
+    if spatial_order is not None:
+        surface_ids = spatial_order[is_surface[spatial_order]]
+    else:
+        surface_ids = is_surface.nonzero(as_tuple=False).squeeze(1)
     num_surface = surface_ids.shape[0]
 
     batch_size = _auto_voting_batch(T, batch_size, device)
@@ -277,8 +286,9 @@ def run_voting(tg, radius_hit, batch_size=256):
     print(f"\nVoting: radius_hit={radius_hit}, g_max={g_max:.4f}")
     print(f"  {tg.num_triangles} triangles")
 
-    normal_vector_voting(tg, g_max, batch_size)
-    curvature_voting(tg, g_max, batch_size)
+    spatial_order = _spatial_sort(tg)
+    normal_vector_voting(tg, g_max, batch_size, spatial_order)
+    curvature_voting(tg, g_max, batch_size, spatial_order)
     return tg
 
 
@@ -300,6 +310,33 @@ def _fix_normal_orientation(tg, n_v):
 
     flip = (n_v * avg_n).sum(dim=1) < 0
     n_v[flip] *= -1
+
+
+def _spatial_sort(tg):
+    """Sort triangle indices by Morton (Z-order) curve for spatial locality."""
+    centers = tg.centers.cpu().numpy()
+    # Quantize to 10-bit integers per axis
+    mn = centers.min(axis=0)
+    mx = centers.max(axis=0)
+    rng = mx - mn
+    rng[rng == 0] = 1.0
+    quantized = ((centers - mn) / rng * 1023).astype(np.int64).clip(0, 1023)
+
+    # Morton code: interleave bits of x, y, z
+    def spread_bits(v):
+        """Spread 10-bit value into every 3rd bit position."""
+        v = (v | (v << 16)) & 0x030000FF
+        v = (v | (v <<  8)) & 0x0300F00F
+        v = (v | (v <<  4)) & 0x030C30C3
+        v = (v | (v <<  2)) & 0x09249249
+        return v
+
+    morton = (spread_bits(quantized[:, 0]) |
+              (spread_bits(quantized[:, 1]) << 1) |
+              (spread_bits(quantized[:, 2]) << 2))
+
+    order = np.argsort(morton)
+    return torch.tensor(order, dtype=torch.long, device=tg.device)
 
 
 def _auto_voting_batch(num_triangles, requested, device):

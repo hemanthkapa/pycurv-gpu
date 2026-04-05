@@ -138,7 +138,7 @@ def main():
     parser.add_argument('--pixel-size', type=float, default=1.0)
     parser.add_argument('--min-component', type=int, default=30)
     parser.add_argument('--exclude-borders', type=int, default=0)
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--batch-size', type=int, default=1024)
     parser.add_argument('--no-clean', action='store_true')
     parser.add_argument('--no-vtp', action='store_true', help='Skip VTP output')
     parser.add_argument('--config', type=str, default=None)
