@@ -141,6 +141,8 @@ def main():
     parser.add_argument('--batch-size', type=int, default=1024)
     parser.add_argument('--no-clean', action='store_true')
     parser.add_argument('--no-vtp', action='store_true', help='Skip VTP output')
+    parser.add_argument('--no-cache-sssp', action='store_true',
+                        help='Disable SSSP caching between passes (saves ~3.5GB RAM)')
     parser.add_argument('--config', type=str, default=None)
     parser.add_argument('--device', type=str, default=None)
     args = parser.parse_args()
@@ -184,7 +186,8 @@ def main():
                    min_component=args.min_component)
 
     # 3. Run voting (per-triangle on triangle adjacency graph)
-    run_voting(tg, args.radius_hit, args.batch_size)
+    run_voting(tg, args.radius_hit, args.batch_size,
+               cache_sssp=not args.no_cache_sssp)
 
     # 4. Write VTP output
     if not args.no_vtp:

@@ -30,15 +30,13 @@ from .geodesic import sssp_triangle_batch, get_free_memory
 # Pass 1: Normal Vector Voting (per-triangle)
 # ---------------------------------------------------------------------------
 
-def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None):
+def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None, sssp_cache=None):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
     a_max = tg.max_triangle_area
 
     V_matrices = torch.zeros(T, 3, 3, dtype=torch.float32, device=device)
-
-    batch_size = _auto_voting_batch(T, batch_size, device)
 
     # Use spatial ordering for better subgraph locality
     all_sources = spatial_order if spatial_order is not None else torch.arange(T, device=device)
@@ -52,6 +50,9 @@ def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None):
 
         # SSSP on triangle adjacency graph — returns sparse neighbors
         src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
+
+        if sssp_cache is not None:
+            sssp_cache.append((src_local.cpu(), nbr_idx.cpu(), g_i.cpu()))
 
         if src_local.numel() == 0:
             continue
@@ -123,7 +124,7 @@ def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None):
 # Pass 2: Curvature Voting (AVV — area-weighted, per-triangle)
 # ---------------------------------------------------------------------------
 
-def curvature_voting(tg, g_max, batch_size=256, spatial_order=None):
+def curvature_voting(tg, g_max, batch_size=256, spatial_order=None, sssp_cache=None):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
@@ -142,17 +143,21 @@ def curvature_voting(tg, g_max, batch_size=256, spatial_order=None):
         surface_ids = is_surface.nonzero(as_tuple=False).squeeze(1)
     num_surface = surface_ids.shape[0]
 
-    batch_size = _auto_voting_batch(T, batch_size, device)
-
     t0 = time.time()
     num_batches = (num_surface + batch_size - 1) // batch_size
+
+    if sssp_cache is not None:
+        assert len(sssp_cache) == num_batches, \
+            f"SSSP cache/batch mismatch: {len(sssp_cache)} cached vs {num_batches} batches"
 
     for b_idx, start in enumerate(range(0, num_surface, batch_size)):
         end = min(start + batch_size, num_surface)
         sources = surface_ids[start:end]
 
-        # SSSP on triangle adjacency graph — returns sparse neighbors
-        src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
+        if sssp_cache is not None:
+            src_local, nbr_idx, g_i = (t.to(device) for t in sssp_cache[b_idx])
+        else:
+            src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
 
         # Filter to surface-only neighbors
         if src_local.numel() > 0:
@@ -281,14 +286,26 @@ def curvature_voting(tg, g_max, batch_size=256, spatial_order=None):
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def run_voting(tg, radius_hit, batch_size=256):
+def run_voting(tg, radius_hit, batch_size=256, cache_sssp=True):
     g_max = math.pi * radius_hit / 2.0
     print(f"\nVoting: radius_hit={radius_hit}, g_max={g_max:.4f}")
     print(f"  {tg.num_triangles} triangles")
 
     spatial_order = _spatial_sort(tg)
-    normal_vector_voting(tg, g_max, batch_size, spatial_order)
-    curvature_voting(tg, g_max, batch_size, spatial_order)
+
+    # Unify batch size: use conservative estimate so both passes have same boundaries
+    batch_size = _auto_voting_batch(tg.num_triangles, batch_size, tg.device)
+
+    if cache_sssp:
+        sssp_cache = []
+        normal_vector_voting(tg, g_max, batch_size, spatial_order, sssp_cache=sssp_cache)
+        print(f"  SSSP cache: {len(sssp_cache)} batches, "
+              f"{sum(c[0].numel() for c in sssp_cache)/1e6:.1f}M entries")
+        curvature_voting(tg, g_max, batch_size, spatial_order, sssp_cache=sssp_cache)
+        del sssp_cache
+    else:
+        normal_vector_voting(tg, g_max, batch_size, spatial_order)
+        curvature_voting(tg, g_max, batch_size, spatial_order)
     return tg
 
 
