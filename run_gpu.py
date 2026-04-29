@@ -178,12 +178,13 @@ def main():
     build_from_vtp(str(vtp_path), tg)
     build_adjacency(tg)
     compute_edge_distances(tg)
-    build_csr(tg)
 
     # 2. Preprocess
     if not args.no_clean:
         clean_mesh(tg, pixel_size=args.pixel_size,
                    min_component=args.min_component)
+
+    build_csr(tg)
 
     # 3. Run voting (per-triangle on triangle adjacency graph)
     run_voting(tg, args.radius_hit, args.batch_size,
