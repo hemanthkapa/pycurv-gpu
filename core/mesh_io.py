@@ -213,6 +213,78 @@ def save_vtp(tg, filepath):
     print(f"Wrote VTP with {T} triangles, {poly.GetCellData().GetNumberOfArrays()} arrays to {filepath}")
 
 
+def save_gt(tg, filepath):
+    """Write the triangle dual graph + curvature data as a graph-tool .gt file.
+
+    Each graph vertex = one triangle; edges = shared-vertex adjacency. Curvature
+    arrays are stored as vertex property maps under the same names as the VTP
+    cell arrays, so pycurv's downstream readers pick them up. Requires graph-tool
+    (conda install -c conda-forge graph-tool).
+    """
+    try:
+        from graph_tool.all import Graph
+    except ImportError as e:
+        raise RuntimeError(
+            "graph-tool is required for .gt output. Install with:\n"
+            "  conda install -c conda-forge graph-tool"
+        ) from e
+
+    T = tg.num_triangles
+    g = Graph(directed=False)
+    g.add_vertex(T)
+
+    # Vertex properties: (name, tensor, gt_type). Mirrors save_vtp cell arrays.
+    vprops = [
+        ('xyz', tg.centers, 'vector<float>'),
+        ('area', tg.areas, 'float'),
+        ('normal', tg.normals, 'vector<float>'),
+    ]
+    if tg.n_v is not None:
+        vprops.append(('n_v', tg.n_v, 'vector<float>'))
+    if tg.orientation_class is not None:
+        vprops.append(('orientation_class', tg.orientation_class, 'int'))
+    if tg.t_1 is not None:
+        vprops.append(('t_1', tg.t_1, 'vector<float>'))
+    if tg.t_2 is not None:
+        vprops.append(('t_2', tg.t_2, 'vector<float>'))
+    if tg.kappa_1 is not None:
+        vprops += [
+            ('kappa_1', tg.kappa_1, 'float'),
+            ('kappa_2', tg.kappa_2, 'float'),
+            ('gauss_curvature_VV', tg.gauss_curvature, 'float'),
+            ('mean_curvature_VV', tg.mean_curvature, 'float'),
+            ('shape_index_VV', tg.shape_index, 'float'),
+            ('curvedness_VV', tg.curvedness, 'float'),
+        ]
+
+    for name, tensor, gt_type in vprops:
+        arr = tensor.cpu().numpy()
+        vp = g.new_vertex_property(gt_type)
+        if gt_type == 'vector<float>':
+            vp.set_2d_array(arr.astype(np.float64).T)  # [ncomp, T]
+        elif gt_type == 'int':
+            vp.a = arr.astype(np.int32)
+        else:
+            vp.a = arr.astype(np.float64)
+        g.vertex_properties[name] = vp
+
+    # Edges from the triangle dual graph (dedupe directed pairs to undirected).
+    src = tg.edge_src.cpu().numpy()
+    dst = tg.edge_dst.cpu().numpy()
+    dist = tg.edge_dist.cpu().numpy().astype(np.float64)
+    keep = src < dst
+    edist = g.new_edge_property('float')
+    g.add_edge_list(
+        np.column_stack([src[keep], dst[keep], dist[keep]]),
+        eprops=[edist],
+    )
+    g.edge_properties['distance'] = edist
+
+    g.save(str(filepath))
+    print(f"Wrote .gt with {T} triangles, {g.num_edges()} edges, "
+          f"{len(g.vertex_properties)} vertex arrays to {filepath}")
+
+
 def build_vertex_graph(tg):
     """
     Build vertex-level graph from triangle data. Must run AFTER preprocessing

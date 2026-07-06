@@ -17,7 +17,7 @@ import yaml
 
 from core import (TriangleGraphGPU, build_from_vtp, build_adjacency,
                   compute_edge_distances, clean_mesh, find_border_triangles,
-                  run_voting, save_vtp, build_csr)
+                  run_voting, save_vtp, save_gt, build_csr)
 
 
 def shape_index_classify(si):
@@ -141,6 +141,8 @@ def main():
     parser.add_argument('--batch-size', type=int, default=1024)
     parser.add_argument('--no-clean', action='store_true')
     parser.add_argument('--no-vtp', action='store_true', help='Skip VTP output')
+    parser.add_argument('--gt', action='store_true',
+                        help='Also write graph-tool .gt output (needs graph-tool)')
     parser.add_argument('--no-cache-sssp', action='store_true',
                         help='Disable SSSP caching between passes (saves ~3.5GB RAM)')
     parser.add_argument('--config', type=str, default=None)
@@ -194,6 +196,10 @@ def main():
     if not args.no_vtp:
         vtp_out = output_dir / f"{basename}.AVV_rh{rh_str}.vtp"
         save_vtp(tg, str(vtp_out))
+
+    if args.gt:
+        gt_out = output_dir / f"{basename}.AVV_rh{rh_str}.gt"
+        save_gt(tg, str(gt_out))
 
     # 5. Extract curvatures (CSV)
     csv_path = output_dir / f"{basename}.AVV_rh{rh_str}.csv"
