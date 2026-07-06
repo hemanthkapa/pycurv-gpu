@@ -23,14 +23,15 @@ import math
 import time
 import numpy as np
 
-from .geodesic import sssp_triangle_batch, get_free_memory
+from .geodesic import (sssp_triangle_batch, get_free_memory,
+                       PROFILE, prof_add, prof_reset, prof_report, _prof_sync)
 
 
 # ---------------------------------------------------------------------------
 # Pass 1: Normal Vector Voting (per-triangle)
 # ---------------------------------------------------------------------------
 
-def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None, sssp_cache=None):
+def normal_vector_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
@@ -41,21 +42,42 @@ def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None, sssp_cac
     # Use spatial ordering for better subgraph locality
     all_sources = spatial_order if spatial_order is not None else torch.arange(T, device=device)
 
-    t0 = time.time()
-    num_batches = (T + batch_size - 1) // batch_size
+    # Cache budget: keep SSSP results on-device (avoids a full D2H+H2D round trip
+    # between passes) until we'd consume more than this share of free memory,
+    # then spill the remaining batches to host RAM.
+    cache_gpu_budget = get_free_memory(device) * 0.25 if sssp_cache is not None else 0
+    cache_gpu_used = 0
 
-    for b_idx, start in enumerate(range(0, T, batch_size)):
-        end = min(start + batch_size, T)
+    t0 = time.time()
+    num_batches = len(packs)
+
+    for b_idx, (start, end) in enumerate(packs):
         sources = all_sources[start:end]
 
         # SSSP on triangle adjacency graph — returns sparse neighbors
+        if PROFILE:
+            _prof_sync(device); _t = time.perf_counter()
         src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
+        if PROFILE:
+            _prof_sync(device); prof_add('p1_sssp', time.perf_counter() - _t)
 
         if sssp_cache is not None:
-            sssp_cache.append((src_local.cpu(), nbr_idx.cpu(), g_i.cpu()))
+            if PROFILE:
+                _prof_sync(device); _t = time.perf_counter()
+            entry_bytes = (src_local.numel() + nbr_idx.numel()) * 8 + g_i.numel() * 4
+            if cache_gpu_used + entry_bytes <= cache_gpu_budget:
+                sssp_cache.append((src_local, nbr_idx, g_i))
+                cache_gpu_used += entry_bytes
+            else:
+                sssp_cache.append((src_local.cpu(), nbr_idx.cpu(), g_i.cpu()))
+            if PROFILE:
+                _prof_sync(device); prof_add('p1_cache_store', time.perf_counter() - _t)
 
         if src_local.numel() == 0:
             continue
+
+        if PROFILE:
+            _prof_sync(device); _t = time.perf_counter()
 
         src_global = sources[src_local]
 
@@ -82,6 +104,9 @@ def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None, sssp_cac
         V_matrices.scatter_add_(0, idx, V_i)
 
         del V_i, wn
+
+        if PROFILE:
+            _prof_sync(device); prof_add('p1_vote', time.perf_counter() - _t)
 
         if (b_idx + 1) % max(1, num_batches // 5) == 0 or (b_idx + 1) == num_batches:
             elapsed = time.time() - t0
@@ -124,7 +149,7 @@ def normal_vector_voting(tg, g_max, batch_size=256, spatial_order=None, sssp_cac
 # Pass 2: Curvature Voting (AVV — area-weighted, per-triangle)
 # ---------------------------------------------------------------------------
 
-def curvature_voting(tg, g_max, batch_size=256, spatial_order=None, sssp_cache=None):
+def curvature_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
@@ -144,20 +169,30 @@ def curvature_voting(tg, g_max, batch_size=256, spatial_order=None, sssp_cache=N
     num_surface = surface_ids.shape[0]
 
     t0 = time.time()
-    num_batches = (num_surface + batch_size - 1) // batch_size
+    num_batches = len(packs)
 
     if sssp_cache is not None:
         assert len(sssp_cache) == num_batches, \
             f"SSSP cache/batch mismatch: {len(sssp_cache)} cached vs {num_batches} batches"
 
-    for b_idx, start in enumerate(range(0, num_surface, batch_size)):
-        end = min(start + batch_size, num_surface)
+    for b_idx, (start, end) in enumerate(packs):
         sources = surface_ids[start:end]
 
         if sssp_cache is not None:
-            src_local, nbr_idx, g_i = (t.to(device) for t in sssp_cache[b_idx])
+            if PROFILE:
+                _prof_sync(device); _t = time.perf_counter()
+            # Entries may live on GPU (kept) or CPU (spilled); .to() is a no-op
+            # when the tensor is already on the target device.
+            src_local, nbr_idx, g_i = (t.to(device, non_blocking=True)
+                                       for t in sssp_cache[b_idx])
+            if PROFILE:
+                _prof_sync(device); prof_add('p2_cache_load', time.perf_counter() - _t)
         else:
+            if PROFILE:
+                _prof_sync(device); _t = time.perf_counter()
             src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
+            if PROFILE:
+                _prof_sync(device); prof_add('p2_sssp', time.perf_counter() - _t)
 
         # Filter to surface-only neighbors
         if src_local.numel() > 0:
@@ -291,21 +326,31 @@ def run_voting(tg, radius_hit, batch_size=256, cache_sssp=True):
     print(f"\nVoting: radius_hit={radius_hit}, g_max={g_max:.4f}")
     print(f"  {tg.num_triangles} triangles")
 
+    if PROFILE:
+        prof_reset()
+
     spatial_order = _spatial_sort(tg)
 
-    # Unify batch size: use conservative estimate so both passes have same boundaries
-    batch_size = _auto_voting_batch(tg.num_triangles, batch_size, tg.device)
+    # Group sources into memory-bounded, spatially-local packs. Both passes
+    # iterate the same packs so cached SSSP results line up batch-for-batch.
+    packs = _compute_packs(tg, spatial_order, batch_size, g_max)
+    print(f"  {len(packs)} SSSP packs "
+          f"(sizes {min(e-s for s,e in packs)}-{max(e-s for s,e in packs)})")
 
     if cache_sssp:
         sssp_cache = []
-        normal_vector_voting(tg, g_max, batch_size, spatial_order, sssp_cache=sssp_cache)
+        normal_vector_voting(tg, g_max, packs, spatial_order, sssp_cache=sssp_cache)
         print(f"  SSSP cache: {len(sssp_cache)} batches, "
               f"{sum(c[0].numel() for c in sssp_cache)/1e6:.1f}M entries")
-        curvature_voting(tg, g_max, batch_size, spatial_order, sssp_cache=sssp_cache)
+        curvature_voting(tg, g_max, packs, spatial_order, sssp_cache=sssp_cache)
         del sssp_cache
     else:
-        normal_vector_voting(tg, g_max, batch_size, spatial_order)
-        curvature_voting(tg, g_max, batch_size, spatial_order)
+        normal_vector_voting(tg, g_max, packs, spatial_order)
+        curvature_voting(tg, g_max, packs, spatial_order)
+
+    if PROFILE:
+        print("\nVoting profile breakdown:")
+        print(prof_report())
     return tg
 
 
@@ -356,21 +401,55 @@ def _spatial_sort(tg):
     return torch.tensor(order, dtype=torch.long, device=tg.device)
 
 
-def _auto_voting_batch(num_triangles, requested, device):
-    # With sparse SSSP, the subgraph is the UNION of reachable nodes from
-    # all B sources. More sources = larger union. At B=256, subgraph ~2% of T.
-    # Union grows sublinearly with B (sources overlap). Estimate:
-    #   L ~ min(T, per_source_reach * B^0.6)
-    # Conservative: use full T for memory estimate (safe upper bound).
-    # The real gain from sparse SSSP is avoiding the clone, not the allocation.
-    bytes_per_source = num_triangles * 9 + 4000
-    free_mem = get_free_memory(device)
-    max_bytes = free_mem * 0.40
-    safe = max(1, int(max_bytes / bytes_per_source))
-    chosen = min(requested, safe)
-    if chosen < requested:
-        print(f"Auto-reduced voting batch {requested} -> {chosen}")
-    return chosen
+def _compute_packs(tg, order, requested, g_max):
+    """Group spatially-sorted sources into memory-bounded SSSP packs.
+
+    The dense SSSP matrix for a pack of B sources is [B, L], where L is the
+    union of nodes reachable within g_max from those sources. Because `order`
+    is Morton-sorted, consecutive sources overlap heavily, so L grows sublinearly
+    within a pack. We grow each pack greedily until either the estimated dense
+    footprint (B * L) would exceed the memory budget or B hits the cap, measuring
+    the real union L at geometric steps (extraction is cheap next to the solve).
+
+    Returns a list of (start, end) index ranges into `order`. Both voting passes
+    iterate the *same* pack list so the cached SSSP results stay aligned.
+    """
+    from .geodesic import _extract_subgraph, _estimate_max_iters
+
+    T = order.shape[0]
+    device = tg.device
+    max_bytes = get_free_memory(device) * 0.40
+    max_iters = _estimate_max_iters(tg.edge_dist, tg.num_triangles, g_max)
+
+    def footprint(b, l):
+        # ~9 bytes per (row, col) for dist(f32)+is_active(bool)+working buffers.
+        return b * (l * 9 + 4000)
+
+    # Memory cap on B given a probe union at the requested size.
+    probe_b = min(requested, T)
+    probe_nodes, *_ = _extract_subgraph(tg, order[:probe_b], g_max, max_iters)
+    L_probe = max(int(probe_nodes.shape[0]), 1)
+    b_cap = requested
+    if footprint(requested, L_probe) > max_bytes:
+        b_cap = max(1, int(max_bytes / (L_probe * 9 + 4000)))
+        print(f"Auto-reduced voting batch cap {requested} -> {b_cap} "
+              f"(probe L={L_probe}, {max_bytes/1e9/0.40:.1f} GB free)")
+
+    step = max(b_cap // 4, 32)
+    packs = []
+    start = 0
+    while start < T:
+        end = min(start + step, T)
+        # Grow the pack while it stays within both the size cap and mem budget.
+        while end < T and (end - start) < b_cap:
+            cand = min(end + step, start + b_cap, T)
+            nodes, *_ = _extract_subgraph(tg, order[start:cand], g_max, max_iters)
+            if footprint(cand - start, int(nodes.shape[0])) > max_bytes:
+                break
+            end = cand
+        packs.append((start, end))
+        start = end
+    return packs
 
 
 def _batched_eigh(matrices, device, chunk_size=16384):
