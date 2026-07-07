@@ -63,6 +63,20 @@ def prof_report():
     return "\n".join(lines)
 
 
+_sssp_backend = 'spfa'
+
+
+def set_sssp_mode(mode):
+    """Select SSSP solver: 'spfa' (frontier relaxation) or 'delta' (delta-stepping)."""
+    global _sssp_backend
+    if mode not in ('spfa', 'delta'):
+        raise ValueError(f"Unknown SSSP mode: {mode}")
+    _sssp_backend = mode
+
+
+set_sssp_backend = set_sssp_mode  # alias
+
+
 def build_csr(tg):
     """Precompute CSR adjacency for fast neighbor lookup. Call once after adjacency build."""
     T = tg.num_triangles
@@ -114,11 +128,19 @@ def sssp_triangle_batch(tg, sources, g_max):
     # Run dense SSSP on the compact subgraph [B, L]
     if PROFILE:
         _prof_sync(device); _t = time.perf_counter()
-    dist = _sssp_dense(
-        local_edge_src, local_edge_dst, local_edge_dist,
-        L, local_sources, g_max=g_max, max_iters=max_iters)
+    if _sssp_backend == 'delta':
+        from .geodesic_delta import _sssp_delta_stepping
+        dist = _sssp_delta_stepping(
+            local_edge_src, local_edge_dst, local_edge_dist,
+            L, local_sources, g_max=g_max)
+        prof_key = 'sssp_delta'
+    else:
+        dist = _sssp_dense(
+            local_edge_src, local_edge_dst, local_edge_dist,
+            L, local_sources, g_max=g_max, max_iters=max_iters)
+        prof_key = 'sssp_dense'
     if PROFILE:
-        _prof_sync(device); prof_add('sssp_dense', time.perf_counter() - _t)
+        _prof_sync(device); prof_add(prof_key, time.perf_counter() - _t)
 
     # Extract sparse neighbors: dist > 0 and <= g_max
     is_nbr = (dist > 0) & (dist <= g_max)
@@ -159,15 +181,14 @@ def _extract_subgraph(tg, sources, g_max, max_iters):
             starts = tg._csr_offsets[frontier]
             ends = tg._csr_offsets[frontier + 1]
             lengths = ends - starts
-            total_edges = lengths.sum().item()
 
-            if total_edges == 0:
+            if not lengths.any():
                 break
 
-            # Build flat index into CSR arrays
-            # For each frontier node, generate indices start, start+1, ..., end-1
+            # Build flat index into CSR arrays (no .item() — avoids GPU sync)
             group_offsets = torch.zeros(lengths.shape[0] + 1, dtype=torch.long, device=device)
             torch.cumsum(lengths, dim=0, out=group_offsets[1:])
+            total_edges = group_offsets[-1]
             within_group = torch.arange(total_edges, device=device) - \
                 torch.repeat_interleave(group_offsets[:-1], lengths)
             flat_idx = torch.repeat_interleave(starts, lengths) + within_group
@@ -208,43 +229,12 @@ def _extract_subgraph(tg, sources, g_max, max_iters):
     global_to_local = torch.full((T,), -1, dtype=torch.long, device=device)
     global_to_local[local_nodes] = torch.arange(L, device=device)
 
-    if has_csr and L > 0:
-        # Gather induced-subgraph edges via CSR: only edges leaving reached
-        # nodes, then keep those whose destination is also reached. This is
-        # O(edges incident to reached) instead of O(E) over the full graph.
-        starts = tg._csr_offsets[local_nodes]
-        lengths = tg._csr_offsets[local_nodes + 1] - starts
-        total = int(lengths.sum())
-        if total > 0:
-            group_off = torch.zeros(L + 1, dtype=torch.long, device=device)
-            torch.cumsum(lengths, dim=0, out=group_off[1:])
-            within = torch.arange(total, device=device) - \
-                torch.repeat_interleave(group_off[:-1], lengths)
-            flat_idx = torch.repeat_interleave(starts, lengths) + within
-
-            # local id of local_nodes[i] is i (local_nodes is sorted ascending)
-            e_src_local = torch.repeat_interleave(
-                torch.arange(L, device=device), lengths)
-            e_dst_local = global_to_local[tg._csr_dst[flat_idx]]
-            e_w = tg._csr_dist[flat_idx]
-
-            valid = e_dst_local >= 0
-            local_edge_src = e_src_local[valid]
-            local_edge_dst = e_dst_local[valid]
-            local_edge_dist = e_w[valid]
-        else:
-            empty = torch.empty(0, dtype=torch.long, device=device)
-            local_edge_src = empty
-            local_edge_dst = empty
-            local_edge_dist = torch.empty(0, dtype=tg.edge_dist.dtype, device=device)
-    else:
-        # Fallback: full-edge scan and relabel
-        src_local = global_to_local[tg.edge_src]
-        dst_local = global_to_local[tg.edge_dst]
-        valid = (src_local >= 0) & (dst_local >= 0)
-        local_edge_src = src_local[valid]
-        local_edge_dst = dst_local[valid]
-        local_edge_dist = tg.edge_dist[valid]
+    src_local = global_to_local[tg.edge_src]
+    dst_local = global_to_local[tg.edge_dst]
+    valid = (src_local >= 0) & (dst_local >= 0)
+    local_edge_src = src_local[valid]
+    local_edge_dst = dst_local[valid]
+    local_edge_dist = tg.edge_dist[valid]
 
     local_sources = global_to_local[sources]
 
@@ -254,13 +244,10 @@ def _extract_subgraph(tg, sources, g_max, max_iters):
 def _sssp_dense(edge_src, edge_dst, edge_dist, num_nodes,
                 sources, g_max=None, max_iters=None):
     """
-    Batched SSSP via SPFA-style frontier relaxation on a compact subgraph.
+    Dense batched SSSP via frontier relaxation on a compact subgraph.
 
-    Keeps a dense [B, V] distance matrix (V ~ few K after subgraph extraction).
-    Each iteration gathers edges leaving only the currently active nodes via a
-    source-CSR (built once), so late iterations — where the frontier is tiny —
-    no longer rescan all E_local edges. The relaxation reduces onto the unique
-    destination columns only, so the full [B, V] matrix is never cloned.
+    With subgraph extraction, V is small (~few K), so full [B, V] clone
+    per iteration is cheap and faster than unique-scatter on this hardware.
     """
     device = edge_src.device
     B = sources.shape[0]
@@ -269,77 +256,45 @@ def _sssp_dense(edge_src, edge_dst, edge_dist, num_nodes,
     if max_iters is None:
         max_iters = V
 
-    INF = float('inf')
-    b_arange = torch.arange(B, device=device)
+    dist = torch.full((B, V), float('inf'), dtype=torch.float32, device=device)
+    dist[torch.arange(B, device=device), sources] = 0.0
 
-    # Source-CSR over the local subgraph: offsets[n]..offsets[n+1] index the
-    # edges leaving node n. Sort once (edges may arrive unsorted from the
-    # fallback extraction path); the CSR then serves every iteration.
-    order = torch.argsort(edge_src)
-    csr_src = edge_src[order]
-    csr_dst = edge_dst[order]
-    csr_w = edge_dist[order]
-    counts = torch.zeros(V, dtype=torch.long, device=device)
-    counts.scatter_add_(0, csr_src, torch.ones_like(csr_src))
-    offsets = torch.zeros(V + 1, dtype=torch.long, device=device)
-    torch.cumsum(counts, dim=0, out=offsets[1:])
-
-    dist = torch.full((B, V), INF, dtype=torch.float32, device=device)
-    dist[b_arange, sources] = 0.0
-
-    # Per-(row, node) activity plus the set of active node ids (frontier).
     is_active = torch.zeros((B, V), dtype=torch.bool, device=device)
-    is_active[b_arange, sources] = True
-    active_nodes = sources.unique()
-
-    gmax_cut = None if g_max is None else g_max + 1e-6
+    is_active[torch.arange(B, device=device), sources] = True
 
     for _ in range(max_iters):
-        if active_nodes.numel() == 0:
+        any_active = is_active.any(dim=0)
+        if not any_active.any():
             break
 
-        # Gather edges leaving active nodes only (CSR frontier expansion).
-        starts = offsets[active_nodes]
-        lengths = offsets[active_nodes + 1] - starts
-        total = int(lengths.sum())
-        if total == 0:
+        frontier_mask = any_active[edge_src]
+        if not frontier_mask.any():
             break
 
-        group_off = torch.zeros(lengths.shape[0] + 1, dtype=torch.long, device=device)
-        torch.cumsum(lengths, dim=0, out=group_off[1:])
-        within = torch.arange(total, device=device) - \
-            torch.repeat_interleave(group_off[:-1], lengths)
-        flat = torch.repeat_interleave(starts, lengths) + within
+        a_src = edge_src[frontier_mask]
+        a_dst = edge_dst[frontier_mask]
+        a_w = edge_dist[frontier_mask]
+        A = a_src.shape[0]
 
-        a_src = torch.repeat_interleave(active_nodes, lengths)
-        a_dst = csr_dst[flat]
-        a_w = csr_w[flat]
-
-        # Per-row proposals; mask rows where the source isn't active this round.
+        row_active = is_active[:, a_src]
         proposal = dist[:, a_src] + a_w.unsqueeze(0)
-        proposal[~is_active[:, a_src]] = INF
-        if gmax_cut is not None:
-            proposal = proposal.clamp(max=gmax_cut)
+        proposal[~row_active] = float('inf')
 
-        # Reduce onto the unique destination columns only (sparse buffer).
-        d_uniq, inv = torch.unique(a_dst, return_inverse=True)
-        old = dist[:, d_uniq]
-        buf = old.clone()
-        buf.scatter_reduce_(1, inv.unsqueeze(0).expand(B, -1), proposal,
-                            reduce='amin', include_self=True)
-
-        improved = buf < old - 1e-10
         if g_max is not None:
-            improved &= (buf <= g_max)
+            proposal = proposal.clamp(max=g_max + 1e-6)
 
-        # Commit distances and refresh frontier, touching changed columns only.
-        dist[:, d_uniq] = buf
-        is_active[:, active_nodes] = False
-        is_active[:, d_uniq] = improved
-        col_any = improved.any(dim=0)
-        active_nodes = d_uniq[col_any]
+        updated = dist.clone()
+        dst_expanded = a_dst.unsqueeze(0).expand(B, A)
+        updated.scatter_reduce_(1, dst_expanded, proposal,
+                                reduce='amin', include_self=True)
 
-        if active_nodes.numel() == 0:
+        improved = updated < dist - 1e-10
+        if g_max is not None:
+            improved &= (updated <= g_max)
+        is_active = improved
+        dist = updated
+
+        if not is_active.any():
             break
 
     return dist

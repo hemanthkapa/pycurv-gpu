@@ -139,6 +139,8 @@ def main():
     parser.add_argument('--min-component', type=int, default=30)
     parser.add_argument('--exclude-borders', type=int, default=0)
     parser.add_argument('--batch-size', type=int, default=1024)
+    parser.add_argument('--sssp', choices=['spfa', 'delta'], default='spfa',
+                        help='SSSP solver: spfa (frontier) or delta (delta-stepping)')
     parser.add_argument('--no-clean', action='store_true')
     parser.add_argument('--no-vtp', action='store_true', help='Skip VTP output')
     parser.add_argument('--gt', action='store_true',
@@ -190,7 +192,7 @@ def main():
 
     # 3. Run voting (per-triangle on triangle adjacency graph)
     run_voting(tg, args.radius_hit, args.batch_size,
-               cache_sssp=not args.no_cache_sssp)
+               cache_sssp=not args.no_cache_sssp, sssp=args.sssp)
 
     # 4. Write VTP output
     if not args.no_vtp:
