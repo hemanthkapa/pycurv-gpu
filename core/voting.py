@@ -31,7 +31,8 @@ from .geodesic import (sssp_triangle_batch, get_free_memory, set_sssp_mode,
 # Pass 1: Normal Vector Voting (per-triangle)
 # ---------------------------------------------------------------------------
 
-def normal_vector_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None):
+def normal_vector_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None,
+                         epsilon=0.0, eta=0.0):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
@@ -112,13 +113,45 @@ def normal_vector_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None):
 
     # Eigendecompose in chunks (cusolver can fail on very large batches)
     eigenvalues, eigenvectors = _batched_eigh(V_matrices, device)
-    # eigh ascending: [:, 2] is largest eigenvalue
+    # eigh ascending: [:, 0]=e3 (smallest), [:, 1]=e2, [:, 2]=e1 (largest)
 
-    # All surface (epsilon=0, eta=0 default)
-    n_v = eigenvectors[:, :, 2].clone().to(torch.float32)
-    tg.orientation_class = torch.ones(T, dtype=torch.long, device=device)
+    if epsilon == 0.0 and eta == 0.0:
+        # Matches CPU pycurv: with defaults, all triangles are "surface patch"
+        # (class 1) — saliency S_s = e1-e2 >= 0 always dominates epsilon*S_c=0
+        # and epsilon*eta*S_n=0, so skip the saliency comparison entirely.
+        n_v = eigenvectors[:, :, 2].clone().to(torch.float32)
+        tg.orientation_class = torch.ones(T, dtype=torch.long, device=device)
+    else:
+        # Page et al. 2002 orientation classification (surface_graphs.py:estimate_normal):
+        # class 1 = surface patch, 2 = crease junction, 3 = no preferred orientation.
+        e1_val, e2_val, e3_val = eigenvalues[:, 2], eigenvalues[:, 1], eigenvalues[:, 0]
+        e1_vec, e3_vec = eigenvectors[:, :, 2], eigenvectors[:, :, 0]
 
-    # Fix orientation: align with original triangle normals
+        S_s = e1_val - e2_val
+        S_c = e2_val - e3_val
+        S_n = e3_val
+
+        saliencies = torch.stack([S_s, epsilon * S_c, epsilon * eta * S_n], dim=1)
+        which = saliencies.argmax(dim=1)
+        tg.orientation_class = (which + 1).to(torch.long)  # 0->1, 1->2, 2->3
+
+        n_v = torch.zeros(T, 3, dtype=torch.float32, device=device)
+        is_class1 = tg.orientation_class == 1
+        n_v[is_class1] = e1_vec[is_class1].to(torch.float32)
+
+        t_v = torch.zeros(T, 3, dtype=torch.float32, device=device)
+        is_class2 = tg.orientation_class == 2
+        t_v[is_class2] = e3_vec[is_class2].to(torch.float32)
+        tg.t_v = t_v
+
+        n_surface = int(is_class1.sum().item())
+        print(f"  orientation_class: {n_surface} surface, "
+              f"{int(is_class2.sum().item())} crease, "
+              f"{T - n_surface - int(is_class2.sum().item())} no-direction "
+              f"(epsilon={epsilon}, eta={eta})")
+
+    # Fix orientation: align with original triangle normals (only meaningful
+    # where n_v is non-zero, i.e. class-1 "surface patch" triangles)
     cos_orig = (n_v * tg.normals).sum(dim=1)
     n_v[cos_orig < 0] *= -1
 
@@ -310,7 +343,8 @@ def curvature_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None):
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def run_voting(tg, radius_hit, batch_size=256, cache_sssp=True, sssp='spfa'):
+def run_voting(tg, radius_hit, batch_size=256, cache_sssp=True, sssp='spfa',
+              epsilon=0.0, eta=0.0):
     g_max = math.pi * radius_hit / 2.0
     print(f"\nVoting: radius_hit={radius_hit}, g_max={g_max:.4f}, sssp={sssp}")
     print(f"  {tg.num_triangles} triangles")
@@ -329,13 +363,14 @@ def run_voting(tg, radius_hit, batch_size=256, cache_sssp=True, sssp='spfa'):
 
     if cache_sssp:
         sssp_cache = []
-        normal_vector_voting(tg, g_max, packs, spatial_order, sssp_cache=sssp_cache)
+        normal_vector_voting(tg, g_max, packs, spatial_order, sssp_cache=sssp_cache,
+                             epsilon=epsilon, eta=eta)
         print(f"  SSSP cache: {len(sssp_cache)} batches, "
               f"{sum(c[0].numel() for c in sssp_cache)/1e6:.1f}M entries")
         curvature_voting(tg, g_max, packs, spatial_order, sssp_cache=sssp_cache)
         del sssp_cache
     else:
-        normal_vector_voting(tg, g_max, packs, spatial_order)
+        normal_vector_voting(tg, g_max, packs, spatial_order, epsilon=epsilon, eta=eta)
         curvature_voting(tg, g_max, packs, spatial_order)
 
     if PROFILE:
