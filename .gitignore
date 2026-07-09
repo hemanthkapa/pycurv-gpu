@@ -212,3 +212,9 @@ self_notes.md
 # Claude Code
 CLAUDE.md
 **/CLAUDE.md
+
+# Personal dev-only benchmark/comparison scripts -- kept locally, not part of
+# the maintained package. test_sphere.py and compare/validate_edge_cases.py
+# remain as the tracked validation tools.
+/benchmark_voting.py
+/compare/compare_curvature.py
