@@ -37,7 +37,10 @@ pip install -r requirements.txt
 ```
 
 Optional: `.gt` (graph-tool) output requires `conda install -c conda-forge graph-tool` (no pip
-wheel exists). Everything else (`.vtp`, `.csv`) has no graph-tool dependency.
+wheel exists) in the same environment. Everything else (`.vtp`, `.csv`) has no graph-tool
+dependency. graph-tool's compiled extension needs a newer libstdc++ than torch otherwise pulls in
+first when both are installed together, so `core/__init__.py` imports graph-tool before torch to
+avoid that -- no action needed on your end, just install it into the same env as torch.
 
 ## Usage
 
