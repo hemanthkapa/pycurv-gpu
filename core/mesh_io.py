@@ -267,6 +267,16 @@ def save_gt(tg, filepath):
             vp.a = arr.astype(np.float64)
         g.vertex_properties[name] = vp
 
+    # Triangle corner coordinates. CPU pycurv stores these as python::object
+    # (list of 3 xyz arrays per vertex). Downstream SM steps call
+    # TriangleGraph.graph_to_triangle_poly(), which requires vp.points.
+    if tg.points is not None:
+        points_np = tg.points.cpu().numpy().astype(np.float64)  # [T, 3, 3]
+        vp_points = g.new_vertex_property('object')
+        for i in range(T):
+            vp_points[i] = [points_np[i, 0], points_np[i, 1], points_np[i, 2]]
+        g.vertex_properties['points'] = vp_points
+
     # Edges from the triangle dual graph (dedupe directed pairs to undirected).
     src = tg.edge_src.cpu().numpy()
     dst = tg.edge_dst.cpu().numpy()
