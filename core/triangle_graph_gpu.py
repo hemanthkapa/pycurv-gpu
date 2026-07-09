@@ -18,22 +18,6 @@ class TriangleGraphGPU:
         self.edge_dst = None      # [E_t] destination triangle indices
         self.edge_dist = None     # [E_t] centroid-to-centroid distances
 
-        # --- Vertex-level geometry ---
-        self.vertex_positions = None   # [P, 3] mesh point coordinates
-        self.vertex_normals = None     # [P, 3] area-weighted averaged normals
-        self.vertex_areas = None       # [P] 1/3 sum of incident triangle areas
-        self.num_points = 0
-
-        # --- Vertex adjacency (primal mesh graph) ---
-        self.v_edge_src = None    # [E_v] source vertex indices
-        self.v_edge_dst = None    # [E_v] destination vertex indices
-        self.v_edge_dist = None   # [E_v] Euclidean edge lengths
-
-        # --- Triangle <-> Vertex mappings ---
-        self.face_vertex_ids = None    # [T, 3] local vertex IDs per triangle
-        self.point_tri_offsets = None  # [P+1] CSR offsets: vertex -> triangles
-        self.point_tri_indices = None  # [total] CSR values: triangle indices
-
         # --- Algorithm outputs (per triangle) ---
         self.n_v = None               # [T, 3] estimated normals (Pass 1)
         self.orientation_class = None  # [T] 1=surface, 2=crease, 3=noise

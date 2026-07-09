@@ -14,8 +14,7 @@ def load_vtp(filepath):
 def build_from_vtp(filepath, tg):
     """
     Parse a .vtp mesh and fill tg with triangle-level geometry tensors.
-    Stashes _face_point_ids and _all_vertices for later use by
-    build_adjacency and build_vertex_graph.
+    Stashes _face_point_ids and _all_vertices for later use by build_adjacency.
     """
     surface = load_vtp(filepath)
 
@@ -285,102 +284,3 @@ def save_gt(tg, filepath):
           f"{len(g.vertex_properties)} vertex arrays to {filepath}")
 
 
-def build_vertex_graph(tg):
-    """
-    Build vertex-level graph from triangle data. Must run AFTER preprocessing
-    (which may remove triangles). Remaps global VTK point IDs to contiguous
-    local IDs [0..P-1].
-
-    Builds: vertex_positions, vertex_normals, vertex_areas, vertex adjacency
-    (v_edge_src/dst/dist), face_vertex_ids, CSR vertex->triangle mapping.
-    """
-    faces_global = tg._face_point_ids  # [T, 3] global VTK point IDs
-    all_vtk_verts = tg._all_vertices   # [N_vtk, 3]
-
-    # Remap global IDs -> contiguous local IDs
-    unique_global, local_ids = np.unique(faces_global, return_inverse=True)
-    local_faces = local_ids.reshape(-1, 3)  # [T, 3] local vertex IDs
-    P = unique_global.shape[0]
-    T = local_faces.shape[0]
-
-    # Vertex positions
-    positions = all_vtk_verts[unique_global]  # [P, 3]
-    tg.vertex_positions = torch.tensor(
-        positions, dtype=torch.float32, device=tg.device)
-    tg.num_points = P
-    tg.face_vertex_ids = torch.tensor(
-        local_faces, dtype=torch.long, device=tg.device)
-
-    # Build vertex adjacency from triangle edges (mesh edges, bidirectional)
-    e0 = local_faces[:, [0, 1]]
-    e1 = local_faces[:, [1, 2]]
-    e2 = local_faces[:, [2, 0]]
-    all_edges = np.vstack([e0, e1, e2])  # [3T, 2]
-
-    # Deduplicate: sort each edge, then unique
-    sorted_e = np.sort(all_edges, axis=1)
-    unique_mesh_edges = np.unique(sorted_e, axis=0)  # [E_unique, 2]
-
-    # Bidirectional
-    src = np.concatenate([unique_mesh_edges[:, 0], unique_mesh_edges[:, 1]])
-    dst = np.concatenate([unique_mesh_edges[:, 1], unique_mesh_edges[:, 0]])
-
-    tg.v_edge_src = torch.tensor(src, dtype=torch.long, device=tg.device)
-    tg.v_edge_dst = torch.tensor(dst, dtype=torch.long, device=tg.device)
-
-    # Edge distances (Euclidean between mesh vertices)
-    src_pos = tg.vertex_positions[tg.v_edge_src]
-    dst_pos = tg.vertex_positions[tg.v_edge_dst]
-    tg.v_edge_dist = torch.linalg.norm(src_pos - dst_pos, dim=1)
-
-    # CSR mapping: vertex -> incident triangles
-    # For each triangle t, its 3 vertices point to t
-    tri_indices = np.repeat(np.arange(T), 3)  # [3T]
-    vert_indices = local_faces.ravel()         # [3T]
-
-    sort_order = np.argsort(vert_indices)
-    sorted_verts = vert_indices[sort_order]
-    sorted_tris = tri_indices[sort_order]
-
-    # CSR offsets
-    counts = np.bincount(sorted_verts, minlength=P)
-    offsets = np.zeros(P + 1, dtype=np.int64)
-    np.cumsum(counts, out=offsets[1:])
-
-    tg.point_tri_offsets = torch.tensor(offsets, dtype=torch.long, device=tg.device)
-    tg.point_tri_indices = torch.tensor(sorted_tris, dtype=torch.long, device=tg.device)
-
-    # Per-vertex normals: area-weighted average of incident triangle normals
-    normals_np = tg.normals.cpu().numpy()   # [T, 3]
-    areas_np = tg.areas.cpu().numpy()       # [T]
-    weighted_normals = normals_np * areas_np[:, np.newaxis]  # [T, 3]
-
-    # Scatter-add weighted normals to vertices
-    vertex_normal_sum = np.zeros((P, 3), dtype=np.float64)
-    for c in range(3):  # for each corner of each triangle
-        np.add.at(vertex_normal_sum, local_faces[:, c], weighted_normals)
-
-    norms = np.linalg.norm(vertex_normal_sum, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)
-    vertex_normals = vertex_normal_sum / norms
-
-    tg.vertex_normals = torch.tensor(
-        vertex_normals, dtype=torch.float32, device=tg.device)
-
-    # Per-vertex areas: 1/3 of incident triangle areas
-    vertex_area_sum = np.zeros(P, dtype=np.float64)
-    for c in range(3):
-        np.add.at(vertex_area_sum, local_faces[:, c], areas_np / 3.0)
-
-    tg.vertex_areas = torch.tensor(
-        vertex_area_sum, dtype=torch.float32, device=tg.device)
-
-    # Clean up temporaries
-    del tg._face_point_ids
-    del tg._all_vertices
-    tg._face_point_ids = None
-    tg._all_vertices = None
-
-    print(f"Built vertex graph: {P} vertices, "
-          f"{unique_mesh_edges.shape[0]} edges")
-    return tg

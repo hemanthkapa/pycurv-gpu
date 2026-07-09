@@ -9,7 +9,7 @@ except ImportError:
     pass
 
 from .triangle_graph_gpu import TriangleGraphGPU
-from .mesh_io import build_from_vtp, build_adjacency, compute_edge_distances, build_vertex_graph, save_vtp, save_gt
+from .mesh_io import build_from_vtp, build_adjacency, compute_edge_distances, save_vtp, save_gt
 from .preprocessing import clean_mesh, find_border_triangles, remove_wrong_border_triangles
 from .geodesic import sssp_triangle_batch, build_csr, set_sssp_mode
 from .voting import run_voting
