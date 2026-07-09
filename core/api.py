@@ -10,6 +10,7 @@ See run_gpu.py for the thin CLI wrapper around this module.
 import time
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 
@@ -143,6 +144,53 @@ def extract_curvatures(tg, output_path, mask=None):
 
 
 # ---------------------------------------------------------------------------
+# NVV (Pass 1) caching -- mirrors CPU pycurv's `.NVV_rh{rh}.gt` skip-if-exists
+# semantics, but uses a dependency-free numpy format so it works without
+# graph-tool. refine_mesh.py-style callers that want a fresh run each time
+# (e.g. after displacing vertices) should delete this file alongside the
+# other stale caches -- see stale_exts in surface_morphometrics/refine_mesh.py.
+# ---------------------------------------------------------------------------
+
+def nvv_cache_path(output_dir, basename, rh_str):
+    return Path(output_dir) / f"{basename}.NVV_rh{rh_str}.gpu_normals.npz"
+
+
+def _centers_checksum(tg):
+    """Cheap order-sensitive fingerprint to detect a changed/rebuilt mesh."""
+    c = tg.centers.detach().cpu().numpy()
+    return float(c.sum()) + float(c[0].sum()) + float(c[-1].sum())
+
+
+def save_nvv_cache(tg, path):
+    np.savez(
+        path,
+        n_v=tg.n_v.cpu().numpy(),
+        orientation_class=tg.orientation_class.cpu().numpy(),
+        num_triangles=np.array(tg.num_triangles),
+        centers_checksum=np.array(_centers_checksum(tg)),
+    )
+    print(f"Cached Pass 1 normals -> {path}")
+
+
+def load_nvv_cache(tg, path):
+    """Try to load cached Pass 1 output into tg. Returns True on success."""
+    try:
+        data = np.load(path)
+    except (OSError, ValueError):
+        return False
+
+    if int(data['num_triangles']) != tg.num_triangles:
+        return False
+    if abs(float(data['centers_checksum']) - _centers_checksum(tg)) > 1e-3:
+        return False
+
+    tg.n_v = torch.tensor(data['n_v'], dtype=torch.float32, device=tg.device)
+    tg.orientation_class = torch.tensor(
+        data['orientation_class'], dtype=torch.long, device=tg.device)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
@@ -150,7 +198,7 @@ def run_pipeline(vtp_path, output_dir=None, radius_hit=10.0, pixel_size=1.0,
                  min_component=30, exclude_borders=0, remove_wrong_borders=False,
                  epsilon=0.0, eta=0.0, batch_size=1024, sssp='spfa', device=None,
                  no_clean=False, write_vtp=True, write_gt=False,
-                 no_cache_sssp=False, cores=None):
+                 cache_normals=True, no_cache_sssp=False, cores=None):
     """
     Run the full GPU curvature pipeline on a single `.surface.vtp` mesh.
 
@@ -189,8 +237,18 @@ def run_pipeline(vtp_path, output_dir=None, radius_hit=10.0, pixel_size=1.0,
 
     build_csr(tg)
 
+    cache_path = nvv_cache_path(output_dir, basename, rh_str)
+    used_cache = False
+    if cache_normals and cache_path.exists():
+        used_cache = load_nvv_cache(tg, cache_path)
+        if used_cache:
+            print(f"Loaded cached Pass 1 normals from {cache_path}")
+
     run_voting(tg, radius_hit, batch_size, cache_sssp=not no_cache_sssp, sssp=sssp,
-              epsilon=epsilon, eta=eta)
+              epsilon=epsilon, eta=eta, skip_normals=used_cache)
+
+    if cache_normals and not used_cache:
+        save_nvv_cache(tg, cache_path)
 
     outputs = {'device': device, 'num_triangles': tg.num_triangles}
 

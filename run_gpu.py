@@ -44,6 +44,8 @@ def main():
                         help='Also write graph-tool .gt output (needs graph-tool)')
     parser.add_argument('--no-cache-sssp', action='store_true',
                         help='Disable SSSP caching between passes (saves ~3.5GB RAM)')
+    parser.add_argument('--no-cache-normals', action='store_true',
+                        help='Disable Pass 1 (NVV) on-disk caching between runs')
     parser.add_argument('--config', type=str, default=None)
     parser.add_argument('--device', type=str, default=None)
     args = parser.parse_args()
@@ -72,6 +74,7 @@ def main():
         no_clean=args.no_clean,
         write_vtp=not args.no_vtp,
         write_gt=args.gt,
+        cache_normals=not args.no_cache_normals,
         no_cache_sssp=args.no_cache_sssp,
     )
 

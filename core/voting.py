@@ -344,7 +344,13 @@ def curvature_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None):
 # ---------------------------------------------------------------------------
 
 def run_voting(tg, radius_hit, batch_size=256, cache_sssp=True, sssp='spfa',
-              epsilon=0.0, eta=0.0):
+              epsilon=0.0, eta=0.0, skip_normals=False):
+    """
+    Run the full two-pass tensor voting pipeline.
+
+    If skip_normals=True, tg.n_v / tg.orientation_class must already be
+    populated (e.g. loaded from an NVV cache) and only Pass 2 (curvature) runs.
+    """
     g_max = math.pi * radius_hit / 2.0
     print(f"\nVoting: radius_hit={radius_hit}, g_max={g_max:.4f}, sssp={sssp}")
     print(f"  {tg.num_triangles} triangles")
@@ -361,7 +367,12 @@ def run_voting(tg, radius_hit, batch_size=256, cache_sssp=True, sssp='spfa',
     packs = _make_fixed_packs(T, batch_size)
     print(f"  {len(packs)} SSSP packs (size {batch_size})")
 
-    if cache_sssp:
+    if skip_normals:
+        assert tg.n_v is not None and tg.orientation_class is not None, \
+            "skip_normals=True requires tg.n_v/orientation_class to be preloaded"
+        print("  Pass 1: skipped (using cached normals)")
+        curvature_voting(tg, g_max, packs, spatial_order)
+    elif cache_sssp:
         sssp_cache = []
         normal_vector_voting(tg, g_max, packs, spatial_order, sssp_cache=sssp_cache,
                              epsilon=epsilon, eta=eta)
