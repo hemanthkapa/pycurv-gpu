@@ -3,3 +3,4 @@ from .mesh_io import build_from_vtp, build_adjacency, compute_edge_distances, bu
 from .preprocessing import clean_mesh, find_border_triangles, remove_wrong_border_triangles
 from .geodesic import sssp_triangle_batch, build_csr, set_sssp_mode
 from .voting import run_voting
+from .api import run_pipeline, extract_curvatures, shape_index_classify, format_radius_hit
