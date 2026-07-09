@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pycurv-gpu"
+version = "0.1.0"
+description = "GPU (PyTorch) reimplementation of pycurv's tensor-voting curvature pipeline for cryo-ET membrane surfaces"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Hemanth Kapa" }]
+dependencies = [
+    "torch>=2.0",
+    "vtk>=9.2",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# graph-tool has no pip wheel; install via conda:
+#   conda install -c conda-forge graph-tool
+# Only needed for --gt / write_gt=True output.
+gt = []
+
+[project.scripts]
+pycurv-gpu = "run_gpu:main"
+
+[tool.setuptools]
+py-modules = ["run_gpu", "benchmark_geodesic", "test_sphere"]
+
+[tool.setuptools.packages.find]
+include = ["core*"]

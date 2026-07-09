@@ -21,15 +21,18 @@ Reference: Page et al. 2002, Tong & Tang 2005, CPU pycurv surface_graphs.py
 import torch
 import math
 import time
+import numpy as np
 
-from .geodesic import sssp_triangle_batch, get_free_memory
+from .geodesic import (sssp_triangle_batch, get_free_memory, set_sssp_mode,
+                       PROFILE, prof_add, prof_reset, prof_report, _prof_sync)
 
 
 # ---------------------------------------------------------------------------
 # Pass 1: Normal Vector Voting (per-triangle)
 # ---------------------------------------------------------------------------
 
-def normal_vector_voting(tg, g_max, batch_size=256):
+def normal_vector_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None,
+                         epsilon=0.0, eta=0.0):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
@@ -37,27 +40,35 @@ def normal_vector_voting(tg, g_max, batch_size=256):
 
     V_matrices = torch.zeros(T, 3, 3, dtype=torch.float32, device=device)
 
-    batch_size = _auto_voting_batch(T, batch_size, device)
+    # Use spatial ordering for better subgraph locality
+    all_sources = spatial_order if spatial_order is not None else torch.arange(T, device=device)
 
     t0 = time.time()
-    num_batches = (T + batch_size - 1) // batch_size
+    num_batches = len(packs)
 
-    for b_idx, start in enumerate(range(0, T, batch_size)):
-        end = min(start + batch_size, T)
-        sources = torch.arange(start, end, device=device)
+    for b_idx, (start, end) in enumerate(packs):
+        sources = all_sources[start:end]
 
-        # SSSP on triangle adjacency graph
-        dist = sssp_triangle_batch(tg, sources, g_max)  # [B, T]
+        # SSSP on triangle adjacency graph — returns sparse neighbors
+        if PROFILE:
+            _prof_sync(device); _t = time.perf_counter()
+        src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
+        if PROFILE:
+            _prof_sync(device); prof_add('p1_sssp', time.perf_counter() - _t)
 
-        # Neighbors: distance > 0 and <= g_max
-        is_nbr = (dist > 0) & (dist <= g_max)  # [B, T]
-        src_local, nbr_idx = is_nbr.nonzero(as_tuple=True)
+        if sssp_cache is not None:
+            if PROFILE:
+                _prof_sync(device); _t = time.perf_counter()
+            sssp_cache.append((src_local.cpu(), nbr_idx.cpu(), g_i.cpu()))
+            if PROFILE:
+                _prof_sync(device); prof_add('p1_cache_store', time.perf_counter() - _t)
 
         if src_local.numel() == 0:
-            del dist, is_nbr
             continue
 
-        g_i = dist[src_local, nbr_idx]
+        if PROFILE:
+            _prof_sync(device); _t = time.perf_counter()
+
         src_global = sources[src_local]
 
         # Normal vote: n_i = n_c + 2*cos(theta)*vc_hat  (Page et al. Eq. 6)
@@ -82,7 +93,10 @@ def normal_vector_voting(tg, g_max, batch_size=256):
         idx = src_global.view(-1, 1, 1).expand_as(V_i)
         V_matrices.scatter_add_(0, idx, V_i)
 
-        del dist, is_nbr, V_i, wn
+        del V_i, wn
+
+        if PROFILE:
+            _prof_sync(device); prof_add('p1_vote', time.perf_counter() - _t)
 
         if (b_idx + 1) % max(1, num_batches // 5) == 0 or (b_idx + 1) == num_batches:
             elapsed = time.time() - t0
@@ -99,13 +113,45 @@ def normal_vector_voting(tg, g_max, batch_size=256):
 
     # Eigendecompose in chunks (cusolver can fail on very large batches)
     eigenvalues, eigenvectors = _batched_eigh(V_matrices, device)
-    # eigh ascending: [:, 2] is largest eigenvalue
+    # eigh ascending: [:, 0]=e3 (smallest), [:, 1]=e2, [:, 2]=e1 (largest)
 
-    # All surface (epsilon=0, eta=0 default)
-    n_v = eigenvectors[:, :, 2].clone().to(torch.float32)
-    tg.orientation_class = torch.ones(T, dtype=torch.long, device=device)
+    if epsilon == 0.0 and eta == 0.0:
+        # Matches CPU pycurv: with defaults, all triangles are "surface patch"
+        # (class 1) — saliency S_s = e1-e2 >= 0 always dominates epsilon*S_c=0
+        # and epsilon*eta*S_n=0, so skip the saliency comparison entirely.
+        n_v = eigenvectors[:, :, 2].clone().to(torch.float32)
+        tg.orientation_class = torch.ones(T, dtype=torch.long, device=device)
+    else:
+        # Page et al. 2002 orientation classification (surface_graphs.py:estimate_normal):
+        # class 1 = surface patch, 2 = crease junction, 3 = no preferred orientation.
+        e1_val, e2_val, e3_val = eigenvalues[:, 2], eigenvalues[:, 1], eigenvalues[:, 0]
+        e1_vec, e3_vec = eigenvectors[:, :, 2], eigenvectors[:, :, 0]
 
-    # Fix orientation: align with original triangle normals
+        S_s = e1_val - e2_val
+        S_c = e2_val - e3_val
+        S_n = e3_val
+
+        saliencies = torch.stack([S_s, epsilon * S_c, epsilon * eta * S_n], dim=1)
+        which = saliencies.argmax(dim=1)
+        tg.orientation_class = (which + 1).to(torch.long)  # 0->1, 1->2, 2->3
+
+        n_v = torch.zeros(T, 3, dtype=torch.float32, device=device)
+        is_class1 = tg.orientation_class == 1
+        n_v[is_class1] = e1_vec[is_class1].to(torch.float32)
+
+        t_v = torch.zeros(T, 3, dtype=torch.float32, device=device)
+        is_class2 = tg.orientation_class == 2
+        t_v[is_class2] = e3_vec[is_class2].to(torch.float32)
+        tg.t_v = t_v
+
+        n_surface = int(is_class1.sum().item())
+        print(f"  orientation_class: {n_surface} surface, "
+              f"{int(is_class2.sum().item())} crease, "
+              f"{T - n_surface - int(is_class2.sum().item())} no-direction "
+              f"(epsilon={epsilon}, eta={eta})")
+
+    # Fix orientation: align with original triangle normals (only meaningful
+    # where n_v is non-zero, i.e. class-1 "surface patch" triangles)
     cos_orig = (n_v * tg.normals).sum(dim=1)
     n_v[cos_orig < 0] *= -1
 
@@ -125,7 +171,7 @@ def normal_vector_voting(tg, g_max, batch_size=256):
 # Pass 2: Curvature Voting (AVV — area-weighted, per-triangle)
 # ---------------------------------------------------------------------------
 
-def curvature_voting(tg, g_max, batch_size=256):
+def curvature_voting(tg, g_max, packs, spatial_order=None, sssp_cache=None):
     T = tg.num_triangles
     device = tg.device
     sigma = g_max / 3.0
@@ -136,29 +182,50 @@ def curvature_voting(tg, g_max, batch_size=256):
     weight_sums = torch.zeros(T, dtype=torch.float64, device=device)
 
     is_surface = tg.orientation_class == 1
-    surface_ids = is_surface.nonzero(as_tuple=False).squeeze(1)
+
+    # Use spatial ordering, filtered to surface-only triangles
+    if spatial_order is not None:
+        surface_ids = spatial_order[is_surface[spatial_order]]
+    else:
+        surface_ids = is_surface.nonzero(as_tuple=False).squeeze(1)
     num_surface = surface_ids.shape[0]
 
-    batch_size = _auto_voting_batch(T, batch_size, device)
-
     t0 = time.time()
-    num_batches = (num_surface + batch_size - 1) // batch_size
+    num_batches = len(packs)
 
-    for b_idx, start in enumerate(range(0, num_surface, batch_size)):
-        end = min(start + batch_size, num_surface)
+    if sssp_cache is not None:
+        assert len(sssp_cache) == num_batches, \
+            f"SSSP cache/batch mismatch: {len(sssp_cache)} cached vs {num_batches} batches"
+
+    for b_idx, (start, end) in enumerate(packs):
         sources = surface_ids[start:end]
 
-        dist = sssp_triangle_batch(tg, sources, g_max)  # [B, T]
+        if sssp_cache is not None:
+            if PROFILE:
+                _prof_sync(device); _t = time.perf_counter()
+            # Entries may live on GPU (kept) or CPU (spilled); .to() is a no-op
+            # when the tensor is already on the target device.
+            src_local, nbr_idx, g_i = (t.to(device, non_blocking=True)
+                                       for t in sssp_cache[b_idx])
+            if PROFILE:
+                _prof_sync(device); prof_add('p2_cache_load', time.perf_counter() - _t)
+        else:
+            if PROFILE:
+                _prof_sync(device); _t = time.perf_counter()
+            src_local, nbr_idx, g_i = sssp_triangle_batch(tg, sources, g_max)
+            if PROFILE:
+                _prof_sync(device); prof_add('p2_sssp', time.perf_counter() - _t)
 
-        # Neighbors: distance > 0, <= g_max, surface only
-        is_nbr = (dist > 0) & (dist <= g_max) & is_surface.unsqueeze(0)
-        src_local, nbr_idx = is_nbr.nonzero(as_tuple=True)
+        # Filter to surface-only neighbors
+        if src_local.numel() > 0:
+            surface_mask = is_surface[nbr_idx]
+            src_local = src_local[surface_mask]
+            nbr_idx = nbr_idx[surface_mask]
+            g_i = g_i[surface_mask]
 
         if src_local.numel() == 0:
-            del dist, is_nbr
             continue
 
-        g_i = dist[src_local, nbr_idx]
         src_global = sources[src_local]
 
         # Weight: (area_i / max_area) * exp(-g_i / sigma)  [AVV]
@@ -199,7 +266,7 @@ def curvature_voting(tg, g_max, batch_size=256):
         B_matrices.scatter_add_(0, idx, B_i.to(torch.float64))
         weight_sums.scatter_add_(0, src_global, w_i.to(torch.float64))
 
-        del dist, is_nbr, B_i
+        del B_i
 
         if (b_idx + 1) % max(1, num_batches // 5) == 0 or (b_idx + 1) == num_batches:
             elapsed = time.time() - t0
@@ -276,13 +343,50 @@ def curvature_voting(tg, g_max, batch_size=256):
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def run_voting(tg, radius_hit, batch_size=256):
+def run_voting(tg, radius_hit, batch_size=256, cache_sssp=True, sssp='spfa',
+              epsilon=0.0, eta=0.0, skip_normals=False):
+    """
+    Run the full two-pass tensor voting pipeline.
+
+    If skip_normals=True, tg.n_v / tg.orientation_class must already be
+    populated (e.g. loaded from an NVV cache) and only Pass 2 (curvature) runs.
+    """
     g_max = math.pi * radius_hit / 2.0
-    print(f"\nVoting: radius_hit={radius_hit}, g_max={g_max:.4f}")
+    print(f"\nVoting: radius_hit={radius_hit}, g_max={g_max:.4f}, sssp={sssp}")
     print(f"  {tg.num_triangles} triangles")
 
-    normal_vector_voting(tg, g_max, batch_size)
-    curvature_voting(tg, g_max, batch_size)
+    set_sssp_mode(sssp)
+
+    if PROFILE:
+        prof_reset()
+
+    spatial_order = _spatial_sort(tg)
+    T = tg.num_triangles
+
+    batch_size = _auto_voting_batch(T, batch_size, tg.device)
+    packs = _make_fixed_packs(T, batch_size)
+    print(f"  {len(packs)} SSSP packs (size {batch_size})")
+
+    if skip_normals:
+        assert tg.n_v is not None and tg.orientation_class is not None, \
+            "skip_normals=True requires tg.n_v/orientation_class to be preloaded"
+        print("  Pass 1: skipped (using cached normals)")
+        curvature_voting(tg, g_max, packs, spatial_order)
+    elif cache_sssp:
+        sssp_cache = []
+        normal_vector_voting(tg, g_max, packs, spatial_order, sssp_cache=sssp_cache,
+                             epsilon=epsilon, eta=eta)
+        print(f"  SSSP cache: {len(sssp_cache)} batches, "
+              f"{sum(c[0].numel() for c in sssp_cache)/1e6:.1f}M entries")
+        curvature_voting(tg, g_max, packs, spatial_order, sssp_cache=sssp_cache)
+        del sssp_cache
+    else:
+        normal_vector_voting(tg, g_max, packs, spatial_order, epsilon=epsilon, eta=eta)
+        curvature_voting(tg, g_max, packs, spatial_order)
+
+    if PROFILE:
+        print("\nVoting profile breakdown:")
+        print(prof_report())
     return tg
 
 
@@ -306,7 +410,41 @@ def _fix_normal_orientation(tg, n_v):
     n_v[flip] *= -1
 
 
+def _spatial_sort(tg):
+    """Sort triangle indices by Morton (Z-order) curve for spatial locality."""
+    centers = tg.centers.cpu().numpy()
+    # Quantize to 10-bit integers per axis
+    mn = centers.min(axis=0)
+    mx = centers.max(axis=0)
+    rng = mx - mn
+    rng[rng == 0] = 1.0
+    quantized = ((centers - mn) / rng * 1023).astype(np.int64).clip(0, 1023)
+
+    # Morton code: interleave bits of x, y, z
+    def spread_bits(v):
+        """Spread 10-bit value into every 3rd bit position."""
+        v = (v | (v << 16)) & 0x030000FF
+        v = (v | (v <<  8)) & 0x0300F00F
+        v = (v | (v <<  4)) & 0x030C30C3
+        v = (v | (v <<  2)) & 0x09249249
+        return v
+
+    morton = (spread_bits(quantized[:, 0]) |
+              (spread_bits(quantized[:, 1]) << 1) |
+              (spread_bits(quantized[:, 2]) << 2))
+
+    order = np.argsort(morton)
+    return torch.tensor(order, dtype=torch.long, device=tg.device)
+
+
+def _make_fixed_packs(T, batch_size):
+    """Fixed Morton-order batch ranges — one extract per pack, no probing."""
+    return [(start, min(start + batch_size, T))
+            for start in range(0, T, batch_size)]
+
+
 def _auto_voting_batch(num_triangles, requested, device):
+    """Cap batch size from conservative full-mesh memory estimate (v3 fast path)."""
     bytes_per_source = num_triangles * 9 + 4000
     free_mem = get_free_memory(device)
     max_bytes = free_mem * 0.40

@@ -14,8 +14,7 @@ def load_vtp(filepath):
 def build_from_vtp(filepath, tg):
     """
     Parse a .vtp mesh and fill tg with triangle-level geometry tensors.
-    Stashes _face_point_ids and _all_vertices for later use by
-    build_adjacency and build_vertex_graph.
+    Stashes _face_point_ids and _all_vertices for later use by build_adjacency.
     """
     surface = load_vtp(filepath)
 
@@ -72,7 +71,6 @@ def build_adjacency(tg):
     T = faces.shape[0]
 
     # Build point -> triangle mapping
-    # For each vertex, find all triangles that use it
     flat_pts = faces.ravel()       # [3T]
     flat_tris = np.repeat(np.arange(T), 3)  # [3T]
 
@@ -81,44 +79,61 @@ def build_adjacency(tg):
     sorted_pts = flat_pts[sort_idx]
     sorted_tris = flat_tris[sort_idx]
 
-    # Find boundaries between different point IDs
+    # Find group boundaries for each point
     change = np.concatenate([[0], np.where(np.diff(sorted_pts) != 0)[0] + 1,
                              [len(sorted_pts)]])
+    group_sizes = np.diff(change)
 
-    # For each point, all triangles sharing it are neighbors of each other
-    src_list = []
-    dst_list = []
-    shared_count = {}  # (min_tri, max_tri) -> count of shared vertices
+    # Generate all triangle pairs sharing a vertex (fully vectorized)
+    # For each entry in a group, pair it with every later entry in that group.
+    # group_id[j] = which group sorted_tris[j] belongs to
+    group_id = np.repeat(np.arange(len(group_sizes)), group_sizes)
+    # local position within group
+    local_pos = np.arange(len(sorted_tris)) - change[group_id]
 
-    for i in range(len(change) - 1):
-        tris_at_point = sorted_tris[change[i]:change[i+1]]
-        n = len(tris_at_point)
-        if n < 2:
-            continue
-        # All pairs of triangles sharing this point
-        for a in range(n):
-            for b in range(a + 1, n):
-                ta, tb = int(tris_at_point[a]), int(tris_at_point[b])
-                key = (min(ta, tb), max(ta, tb))
-                shared_count[key] = shared_count.get(key, 0) + 1
+    # For each element j, pair with elements j+1..end of group.
+    # Repeat each element (group_size - 1 - local_pos) times.
+    repeats = (group_sizes[group_id] - 1 - local_pos).astype(np.intp)
+    repeats = np.maximum(repeats, 0)
 
-    # Create bidirectional edges
-    edges_src = []
-    edges_dst = []
-    is_strong = []
+    pair_a = np.repeat(sorted_tris, repeats)
 
-    for (ta, tb), count in shared_count.items():
-        edges_src.extend([ta, tb])
-        edges_dst.extend([tb, ta])
-        strong = 1 if count >= 2 else 0
-        is_strong.extend([strong, strong])
+    # For pair_b: for element j in group of size k, partners are
+    # the elements at local positions (local_pos+1)..(k-1).
+    # Build partner indices using cumulative offsets.
+    total_pairs = repeats.sum()
+    # For each repeated element j, the partners are consecutive entries after j
+    partner_offsets = np.arange(len(sorted_tris)) + 1  # index of first partner
+    partner_starts = np.repeat(partner_offsets, repeats)
+    # Within each repeated block, add 0, 1, 2, ... to get successive partners
+    block_lengths = repeats[repeats > 0]
+    within_block = np.arange(total_pairs) - np.repeat(
+        np.concatenate([[0], np.cumsum(block_lengths[:-1])]), block_lengths)
+    pair_b = sorted_tris[partner_starts + within_block]
+
+    # Canonicalize: (min, max) and count shared vertices per pair
+    lo = np.minimum(pair_a, pair_b)
+    hi = np.maximum(pair_a, pair_b)
+
+    # Encode pairs as single int for fast grouping
+    edge_keys = lo.astype(np.int64) * T + hi.astype(np.int64)
+    unique_keys, inverse, counts = np.unique(edge_keys, return_inverse=True, return_counts=True)
+
+    ta = unique_keys // T
+    tb = unique_keys % T
+    strong = (counts >= 2).astype(np.int64)
+
+    # Bidirectional edges
+    edges_src = np.concatenate([ta, tb])
+    edges_dst = np.concatenate([tb, ta])
+    is_strong = np.concatenate([strong, strong])
 
     tg.edge_src = torch.tensor(edges_src, dtype=torch.long, device=tg.device)
     tg.edge_dst = torch.tensor(edges_dst, dtype=torch.long, device=tg.device)
     tg.is_strong = torch.tensor(is_strong, dtype=torch.long, device=tg.device)
 
-    num_strong = sum(1 for s in is_strong if s == 1) // 2
-    num_weak = sum(1 for s in is_strong if s == 0) // 2
+    num_strong = int(strong.sum())
+    num_weak = len(strong) - num_strong
     print(f"Built adjacency: {num_strong} strong + {num_weak} weak edges")
     return tg
 
@@ -131,102 +146,141 @@ def compute_edge_distances(tg):
     return tg
 
 
-def build_vertex_graph(tg):
+def save_vtp(tg, filepath):
+    """Write triangle mesh with curvature cell arrays to a VTP file."""
+    points_np = tg.points.cpu().numpy()  # [T, 3, 3]
+    T = points_np.shape[0]
+
+    # Deduplicate vertices (shared points across triangles)
+    flat_pts = points_np.reshape(-1, 3)  # [3T, 3]
+    unique_pts, inverse = np.unique(flat_pts, axis=0, return_inverse=True)
+    face_ids = inverse.reshape(T, 3)  # [T, 3] -> index into unique_pts
+
+    # Build VTK points
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_support.numpy_to_vtk(unique_pts, deep=True))
+
+    # Build VTK triangles
+    cells = vtk.vtkCellArray()
+    connectivity = np.column_stack([
+        np.full(T, 3, dtype=np.int64), face_ids
+    ]).ravel()
+    cells.SetCells(T, numpy_support.numpy_to_vtkIdTypeArray(connectivity, deep=True))
+
+    poly = vtk.vtkPolyData()
+    poly.SetPoints(vtk_points)
+    poly.SetPolys(cells)
+
+    # Cell data arrays: (name, tensor, num_components)
+    cell_arrays = [
+        ('xyz', tg.centers, 3),
+        ('area', tg.areas, 1),
+        ('normal', tg.normals, 3),
+    ]
+    if tg.n_v is not None:
+        cell_arrays.append(('n_v', tg.n_v, 3))
+    if tg.orientation_class is not None:
+        cell_arrays.append(('orientation_class', tg.orientation_class, 1))
+    if tg.t_1 is not None:
+        cell_arrays.append(('t_1', tg.t_1, 3))
+    if tg.t_2 is not None:
+        cell_arrays.append(('t_2', tg.t_2, 3))
+    if tg.kappa_1 is not None:
+        cell_arrays += [
+            ('kappa_1', tg.kappa_1, 1),
+            ('kappa_2', tg.kappa_2, 1),
+            ('gauss_curvature_VV', tg.gauss_curvature, 1),
+            ('mean_curvature_VV', tg.mean_curvature, 1),
+            ('shape_index_VV', tg.shape_index, 1),
+            ('curvedness_VV', tg.curvedness, 1),
+        ]
+
+    for name, tensor, ncomp in cell_arrays:
+        arr = tensor.cpu().numpy().astype(np.float64)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        vtk_arr = numpy_support.numpy_to_vtk(arr, deep=True)
+        vtk_arr.SetName(name)
+        vtk_arr.SetNumberOfComponents(ncomp)
+        poly.GetCellData().AddArray(vtk_arr)
+
+    writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetFileName(str(filepath))
+    writer.SetInputData(poly)
+    if writer.Write() != 1:
+        raise RuntimeError(f"Failed to write VTP file: {filepath}")
+    print(f"Wrote VTP with {T} triangles, {poly.GetCellData().GetNumberOfArrays()} arrays to {filepath}")
+
+
+def save_gt(tg, filepath):
+    """Write the triangle dual graph + curvature data as a graph-tool .gt file.
+
+    Each graph vertex = one triangle; edges = shared-vertex adjacency. Curvature
+    arrays are stored as vertex property maps under the same names as the VTP
+    cell arrays, so pycurv's downstream readers pick them up. Requires graph-tool
+    (conda install -c conda-forge graph-tool).
     """
-    Build vertex-level graph from triangle data. Must run AFTER preprocessing
-    (which may remove triangles). Remaps global VTK point IDs to contiguous
-    local IDs [0..P-1].
+    try:
+        from graph_tool.all import Graph
+    except ImportError as e:
+        raise RuntimeError(
+            "graph-tool is required for .gt output. Install with:\n"
+            "  conda install -c conda-forge graph-tool"
+        ) from e
 
-    Builds: vertex_positions, vertex_normals, vertex_areas, vertex adjacency
-    (v_edge_src/dst/dist), face_vertex_ids, CSR vertex->triangle mapping.
-    """
-    faces_global = tg._face_point_ids  # [T, 3] global VTK point IDs
-    all_vtk_verts = tg._all_vertices   # [N_vtk, 3]
+    T = tg.num_triangles
+    g = Graph(directed=False)
+    g.add_vertex(T)
 
-    # Remap global IDs -> contiguous local IDs
-    unique_global, local_ids = np.unique(faces_global, return_inverse=True)
-    local_faces = local_ids.reshape(-1, 3)  # [T, 3] local vertex IDs
-    P = unique_global.shape[0]
-    T = local_faces.shape[0]
+    # Vertex properties: (name, tensor, gt_type). Mirrors save_vtp cell arrays.
+    vprops = [
+        ('xyz', tg.centers, 'vector<float>'),
+        ('area', tg.areas, 'float'),
+        ('normal', tg.normals, 'vector<float>'),
+    ]
+    if tg.n_v is not None:
+        vprops.append(('n_v', tg.n_v, 'vector<float>'))
+    if tg.orientation_class is not None:
+        vprops.append(('orientation_class', tg.orientation_class, 'int'))
+    if tg.t_1 is not None:
+        vprops.append(('t_1', tg.t_1, 'vector<float>'))
+    if tg.t_2 is not None:
+        vprops.append(('t_2', tg.t_2, 'vector<float>'))
+    if tg.kappa_1 is not None:
+        vprops += [
+            ('kappa_1', tg.kappa_1, 'float'),
+            ('kappa_2', tg.kappa_2, 'float'),
+            ('gauss_curvature_VV', tg.gauss_curvature, 'float'),
+            ('mean_curvature_VV', tg.mean_curvature, 'float'),
+            ('shape_index_VV', tg.shape_index, 'float'),
+            ('curvedness_VV', tg.curvedness, 'float'),
+        ]
 
-    # Vertex positions
-    positions = all_vtk_verts[unique_global]  # [P, 3]
-    tg.vertex_positions = torch.tensor(
-        positions, dtype=torch.float32, device=tg.device)
-    tg.num_points = P
-    tg.face_vertex_ids = torch.tensor(
-        local_faces, dtype=torch.long, device=tg.device)
+    for name, tensor, gt_type in vprops:
+        arr = tensor.cpu().numpy()
+        vp = g.new_vertex_property(gt_type)
+        if gt_type == 'vector<float>':
+            vp.set_2d_array(arr.astype(np.float64).T)  # [ncomp, T]
+        elif gt_type == 'int':
+            vp.a = arr.astype(np.int32)
+        else:
+            vp.a = arr.astype(np.float64)
+        g.vertex_properties[name] = vp
 
-    # Build vertex adjacency from triangle edges (mesh edges, bidirectional)
-    e0 = local_faces[:, [0, 1]]
-    e1 = local_faces[:, [1, 2]]
-    e2 = local_faces[:, [2, 0]]
-    all_edges = np.vstack([e0, e1, e2])  # [3T, 2]
+    # Edges from the triangle dual graph (dedupe directed pairs to undirected).
+    src = tg.edge_src.cpu().numpy()
+    dst = tg.edge_dst.cpu().numpy()
+    dist = tg.edge_dist.cpu().numpy().astype(np.float64)
+    keep = src < dst
+    edist = g.new_edge_property('float')
+    g.add_edge_list(
+        np.column_stack([src[keep], dst[keep], dist[keep]]),
+        eprops=[edist],
+    )
+    g.edge_properties['distance'] = edist
 
-    # Deduplicate: sort each edge, then unique
-    sorted_e = np.sort(all_edges, axis=1)
-    unique_mesh_edges = np.unique(sorted_e, axis=0)  # [E_unique, 2]
+    g.save(str(filepath))
+    print(f"Wrote .gt with {T} triangles, {g.num_edges()} edges, "
+          f"{len(g.vertex_properties)} vertex arrays to {filepath}")
 
-    # Bidirectional
-    src = np.concatenate([unique_mesh_edges[:, 0], unique_mesh_edges[:, 1]])
-    dst = np.concatenate([unique_mesh_edges[:, 1], unique_mesh_edges[:, 0]])
 
-    tg.v_edge_src = torch.tensor(src, dtype=torch.long, device=tg.device)
-    tg.v_edge_dst = torch.tensor(dst, dtype=torch.long, device=tg.device)
-
-    # Edge distances (Euclidean between mesh vertices)
-    src_pos = tg.vertex_positions[tg.v_edge_src]
-    dst_pos = tg.vertex_positions[tg.v_edge_dst]
-    tg.v_edge_dist = torch.linalg.norm(src_pos - dst_pos, dim=1)
-
-    # CSR mapping: vertex -> incident triangles
-    # For each triangle t, its 3 vertices point to t
-    tri_indices = np.repeat(np.arange(T), 3)  # [3T]
-    vert_indices = local_faces.ravel()         # [3T]
-
-    sort_order = np.argsort(vert_indices)
-    sorted_verts = vert_indices[sort_order]
-    sorted_tris = tri_indices[sort_order]
-
-    # CSR offsets
-    counts = np.bincount(sorted_verts, minlength=P)
-    offsets = np.zeros(P + 1, dtype=np.int64)
-    np.cumsum(counts, out=offsets[1:])
-
-    tg.point_tri_offsets = torch.tensor(offsets, dtype=torch.long, device=tg.device)
-    tg.point_tri_indices = torch.tensor(sorted_tris, dtype=torch.long, device=tg.device)
-
-    # Per-vertex normals: area-weighted average of incident triangle normals
-    normals_np = tg.normals.cpu().numpy()   # [T, 3]
-    areas_np = tg.areas.cpu().numpy()       # [T]
-    weighted_normals = normals_np * areas_np[:, np.newaxis]  # [T, 3]
-
-    # Scatter-add weighted normals to vertices
-    vertex_normal_sum = np.zeros((P, 3), dtype=np.float64)
-    for c in range(3):  # for each corner of each triangle
-        np.add.at(vertex_normal_sum, local_faces[:, c], weighted_normals)
-
-    norms = np.linalg.norm(vertex_normal_sum, axis=1, keepdims=True)
-    norms = np.maximum(norms, 1e-12)
-    vertex_normals = vertex_normal_sum / norms
-
-    tg.vertex_normals = torch.tensor(
-        vertex_normals, dtype=torch.float32, device=tg.device)
-
-    # Per-vertex areas: 1/3 of incident triangle areas
-    vertex_area_sum = np.zeros(P, dtype=np.float64)
-    for c in range(3):
-        np.add.at(vertex_area_sum, local_faces[:, c], areas_np / 3.0)
-
-    tg.vertex_areas = torch.tensor(
-        vertex_area_sum, dtype=torch.float32, device=tg.device)
-
-    # Clean up temporaries
-    del tg._face_point_ids
-    del tg._all_vertices
-    tg._face_point_ids = None
-    tg._all_vertices = None
-
-    print(f"Built vertex graph: {P} vertices, "
-          f"{unique_mesh_edges.shape[0]} edges")
-    return tg

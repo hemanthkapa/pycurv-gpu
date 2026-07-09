@@ -11,10 +11,10 @@ Usage:
     # From config.yml:
     python benchmark_geodesic.py --config config.yml
 
-    # GPU only (skip CPU):
+    # GPU only (skip CPU; use this in the `gpu` conda env, which lacks pycurv/graph-tool):
     python benchmark_geodesic.py --skip-cpu surface.vtp
 
-    # CPU only (skip GPU):
+    # CPU only (skip GPU; use this in a pycurv/graph-tool env):
     python benchmark_geodesic.py --skip-gpu surface.vtp
 
     # Custom radius_hit (default: from config or 10):
@@ -32,18 +32,15 @@ from pathlib import Path
 # GPU backend
 # ---------------------------------------------------------------------------
 
-def _gpu_geodesic(vtp_path, radius_hit, g_max, sparse, batch_size=256):
+def _gpu_geodesic(vtp_path, radius_hit, g_max, batch_size=256):
+    """Run just the SSSP step (Pass-1-style neighbor queries) over all triangles."""
     import torch
     from core.triangle_graph_gpu import TriangleGraphGPU
     from core.mesh_io import build_from_vtp, build_adjacency, compute_edge_distances
-    from core.geodesic import compute_geodesic_distances, compute_geodesic_neighbors_sparse
+    from core.geodesic import build_csr, sssp_triangle_batch
+    from core.api import pick_device
 
-    if torch.cuda.is_available():
-        device = 'cuda'
-    elif torch.backends.mps.is_available():
-        device = 'mps'
-    else:
-        device = 'cpu'
+    device = pick_device()
 
     # Load + build graph
     tg = TriangleGraphGPU(device=device)
@@ -51,17 +48,18 @@ def _gpu_geodesic(vtp_path, radius_hit, g_max, sparse, batch_size=256):
     build_from_vtp(str(vtp_path), tg)
     build_adjacency(tg)
     compute_edge_distances(tg)
+    build_csr(tg)
     t_load = time.perf_counter() - t0
 
-    num_v = tg.num_vertices
+    num_v = tg.num_triangles
     num_e = tg.edge_src.shape[0]
 
-    # Geodesic
+    # Geodesic: batched SSSP over all triangles as sources, in chunks of batch_size
     t0 = time.perf_counter()
-    if sparse:
-        compute_geodesic_neighbors_sparse(tg, g_max=g_max, batch_size=batch_size)
-    else:
-        compute_geodesic_distances(tg, g_max=g_max, batch_size=batch_size)
+    all_sources = torch.arange(tg.num_triangles, device=device)
+    for start in range(0, tg.num_triangles, batch_size):
+        sources = all_sources[start:start + batch_size]
+        sssp_triangle_batch(tg, sources, g_max)
     t_geo = time.perf_counter() - t0
 
     return {
@@ -111,7 +109,7 @@ def _cpu_geodesic(vtp_path, radius_hit, g_max):
 # Driver
 # ---------------------------------------------------------------------------
 
-def benchmark_file(vtp_path, radius_hit, g_max, run_cpu, run_gpu, sparse,
+def benchmark_file(vtp_path, radius_hit, g_max, run_cpu, run_gpu,
                    batch_size=256):
     results = []
     name = Path(vtp_path).name
@@ -147,8 +145,7 @@ def benchmark_file(vtp_path, radius_hit, g_max, run_cpu, run_gpu, sparse,
 
     if run_gpu:
         try:
-            r = _gpu_geodesic(vtp_path, radius_hit, g_max, sparse, batch_size)
-            geo_type = "sparse" if sparse else "dense"
+            r = _gpu_geodesic(vtp_path, radius_hit, g_max, batch_size)
             results.append({
                 "label": f"gpu:{name}:load",
                 "seconds": round(r["t_load"], 2),
@@ -156,7 +153,7 @@ def benchmark_file(vtp_path, radius_hit, g_max, run_cpu, run_gpu, sparse,
                 "command": f"pycurv-gpu [{r['num_v']} tri, {r['num_e']} edges]",
             })
             results.append({
-                "label": f"gpu:{name}:geodesic({geo_type})",
+                "label": f"gpu:{name}:geodesic(sparse)",
                 "seconds": round(r["t_geodesic"], 2),
                 "status": "OK",
                 "command": f"g_max={g_max:.4f} device={r['device']}",
@@ -184,8 +181,6 @@ def main():
     parser.add_argument("files", nargs="*", help=".vtp files")
     parser.add_argument("--config", help="config.yml (reads work_dir + radius_hit)")
     parser.add_argument("--radius-hit", type=float, default=None)
-    parser.add_argument("--sparse", action="store_true",
-                        help="GPU: use sparse neighbor computation")
     parser.add_argument("--batch-size", type=int, default=256,
                         help="GPU batch size (default 256, try 2048+ for large VRAM)")
     parser.add_argument("--skip-cpu", action="store_true")
@@ -230,7 +225,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"{vtp.name}")
         results = benchmark_file(vtp, radius_hit, g_max, run_cpu, run_gpu,
-                                 args.sparse, args.batch_size)
+                                 args.batch_size)
         all_results.extend(results)
 
         # Print speedup if both ran

@@ -1,0 +1,10 @@
+# Core dependencies for pycurv-gpu.
+# Install torch matching your CUDA version first, see https://pytorch.org/get-started/locally/
+torch>=2.0
+vtk>=9.2
+numpy>=1.24
+pandas>=2.0
+pyyaml>=6.0
+
+# Optional: only needed for --gt / write_gt=True output (no pip wheel available).
+#   conda install -c conda-forge graph-tool

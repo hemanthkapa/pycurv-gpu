@@ -119,9 +119,76 @@ def _filter_triangles(tg, keep_mask):
     return tg
 
 
-def clean_mesh(tg, pixel_size=1.0, min_component=30):
-    """Full preprocessing pipeline."""
+MAX_DIST_SURF = 3  # matches CPU pycurv's MAX_DIST_SURF constant
+
+
+def remove_wrong_border_triangles(tg, distance):
+    """
+    Purge triangles within `distance` of the mesh border (BFS on strong edges).
+
+    Matches CPU pycurv's TriangleGraph.find_vertices_near_border(b, purge=True):
+    used when remove_wrong_borders=True to "eat back" surfaces reconstructed
+    from segmentations (e.g. marching cubes), which tend to have artificial,
+    jagged borders. Not needed for screened-Poisson meshes (the default
+    surface_morphometrics workflow), where remove_wrong_borders=False.
+    """
+    T = tg.num_triangles
+    device = tg.device
+
+    is_border = find_border_triangles(tg)
+    border_ids = is_border.nonzero(as_tuple=False).squeeze(1)
+
+    if border_ids.numel() == 0:
+        print("No border triangles found; nothing to purge")
+        return tg
+
+    dist = torch.full((T,), float('inf'), dtype=torch.float32, device=device)
+    dist[border_ids] = 0.0
+
+    active = border_ids
+    for _ in range(T):
+        if active.numel() == 0:
+            break
+        is_active = torch.zeros(T, dtype=torch.bool, device=device)
+        is_active[active] = True
+        active_mask = is_active[tg.edge_src]
+
+        src = tg.edge_src[active_mask]
+        dst = tg.edge_dst[active_mask]
+        w = tg.edge_dist[active_mask]
+
+        proposal = dist[src] + w
+        within = proposal <= distance
+        if not within.any():
+            break
+
+        updated = dist.clone()
+        updated.scatter_reduce_(0, dst[within], proposal[within],
+                                reduce='amin', include_self=True)
+
+        improved = updated < dist
+        dist = updated
+        active = improved.nonzero(as_tuple=False).squeeze(1)
+
+    keep_mask = dist > distance
+    removed = T - keep_mask.sum().item()
+    if removed > 0:
+        _filter_triangles(tg, keep_mask)
+        print(f"Removed {removed} triangles within {distance} of border "
+              f"(remove_wrong_borders)")
+    else:
+        print("No border triangles within purge distance")
+    return tg
+
+
+def clean_mesh(tg, pixel_size=1.0, min_component=30, remove_wrong_borders=False):
+    """
+    Full preprocessing pipeline, matching CPU pycurv's new_workflow cleaning
+    order: scale -> (optional) border purge -> small component removal.
+    """
     scale_surface(tg, pixel_size)
+    if remove_wrong_borders:
+        remove_wrong_border_triangles(tg, MAX_DIST_SURF * pixel_size)
     if min_component > 0:
         remove_small_components(tg, min_component)
     return tg
