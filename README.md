@@ -78,6 +78,26 @@ outputs = run_pipeline(
 surface_morphometrics' `curvature.run_pycurv(filename, folder, ...)` signature so it can be called
 in-process instead of shelling out to `run_gpu.py`.
 
+### surface_morphometrics plugin
+
+When pycurv-gpu is installed in the same environment as a packaged
+`surface_morphometrics` (with `morphometrics.commands` plugin support), it
+registers a sibling curvature command:
+
+```bash
+pip install -e /path/to/pycurv-gpu   # same env as morphometrics; needs CUDA torch
+# graph-tool still required for .gt output used by later pipeline steps:
+#   conda install -c conda-forge graph-tool
+
+morphometrics make_meshes config.yml
+morphometrics pycurv_gpu config.yml mito.surface.vtp   # instead of: morphometrics pycurv ...
+morphometrics distances_orientations config.yml
+```
+
+Reads `curvature_measurements` from `config.yml` (same keys as CPU pycurv).
+Writes `.AVV_rh*.vtp` / `.csv` / `.gt` into `work_dir` by default (`--no-gt` to
+skip). Does not replace the built-in `morphometrics pycurv` command.
+
 ### Caching
 
 Pass 1 (normal voting) output is cached to `{basename}.NVV_rh{radius_hit}.gpu_normals.npz`
@@ -97,6 +117,7 @@ core/
   voting.py               Pass 1 (normals) + Pass 2 (AVV curvature) tensor voting
   api.py                  run_pipeline(): the importable, high-level entry point
 run_gpu.py                CLI wrapper around core.api.run_pipeline
+morphometrics_plugin.py   `morphometrics pycurv_gpu` entry point (Click)
 test_sphere.py            analytic validation on a sphere (known curvature = 1/R)
 benchmark_geodesic.py     geodesic-step-only CPU vs GPU benchmark
 compare/                  edge-case/robustness validation suite

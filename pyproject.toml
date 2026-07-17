@@ -16,19 +16,25 @@ dependencies = [
     "numpy>=1.24",
     "pandas>=2.0",
     "pyyaml>=6.0",
+    "click>=8.0",
 ]
 
 [project.optional-dependencies]
 # graph-tool has no pip wheel; install via conda:
 #   conda install -c conda-forge graph-tool
-# Only needed for --gt / write_gt=True output.
+# Only needed for --gt / write_gt=True output (default for the morphometrics plugin).
 gt = []
 
 [project.scripts]
 pycurv-gpu = "run_gpu:main"
 
+# Discovered by surface_morphometrics' LazyGroup when both packages share an env:
+#   morphometrics pycurv_gpu config.yml [mesh.surface.vtp]
+[project.entry-points."morphometrics.commands"]
+pycurv_gpu = "morphometrics_plugin:pycurv_gpu"
+
 [tool.setuptools]
-py-modules = ["run_gpu", "benchmark_geodesic", "test_sphere"]
+py-modules = ["run_gpu", "benchmark_geodesic", "test_sphere", "morphometrics_plugin"]
 
 [tool.setuptools.packages.find]
 include = ["core*"]
