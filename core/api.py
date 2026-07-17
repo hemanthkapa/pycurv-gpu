@@ -204,10 +204,9 @@ def run_pipeline(vtp_path, output_dir=None, radius_hit=10.0, pixel_size=1.0,
 
     Mirrors CPU pycurv's `normals_directions_and_curvature_estimation` /
     surface_morphometrics' `curvature.run_pycurv(filename, folder, ...)`
-    parameters so it can be dispatched to programmatically. See
-    surface_morphometrics/curvature.py:run_pycurv_gpu for the cross-repo
-    (subprocess) integration, since the two pipelines normally run in
-    separate conda environments (torch+GPU vs graph-tool+pycurv).
+    parameters so it can be dispatched programmatically. The morphometrics
+    CLI plugin (`morphometrics pycurv_gpu`, see morphometrics_plugin.py)
+    wraps this function; callers can also import it directly.
 
     `cores` is accepted for signature compatibility with CPU pycurv but is
     ignored -- GPU batch parallelism replaces CPU multiprocessing.
